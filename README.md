@@ -72,9 +72,9 @@ When a card's due date is updated via the `update_card_details` tool, Martello a
 
 ### Relationship Management
 Martello uses specific checklist names to track card lineages:
-- **children**: Links to sub-tasks.
-- **parents**: Links to the parent Epic/Sub-Epic.
+- **children / parents**: For parent-child and epic-subepic hierarchies.
 - **blocked by / blocking**: Manages dependencies and applies the "Blocker" label.
+- **related**: Links related tasks bidirectionally without hierarchy or dependency.
 
 ---
 
