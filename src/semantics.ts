@@ -24,6 +24,18 @@ export class McGawSemantics {
     return true;
   }
 
+  isEpic(cardName: string): boolean {
+    return cardName.includes('EPIC:');
+  }
+
+  isSubEpic(cardName: string): boolean {
+    return cardName.includes('SUB-EPIC:');
+  }
+
+  isEpicOrSubEpic(cardName: string): boolean {
+    return this.isEpic(cardName) || this.isSubEpic(cardName);
+  }
+
   async getBoardMembers(boardId: string): Promise<any[]> {
     return this.client.getBoardMembers(boardId);
   }

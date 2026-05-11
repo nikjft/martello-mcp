@@ -11,6 +11,7 @@ export interface TrelloCard {
   idBoard: string;
   shortUrl: string;
   due?: string;
+  start?: string;
   dueComplete?: boolean;
   labels: { id: string; name: string; color: string }[];
   customFieldItems?: { idCustomField: string; value: { date?: string; text?: string; number?: number } }[];

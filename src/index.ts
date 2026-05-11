@@ -68,6 +68,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         }
       },
       {
+        name: "get_board_lists",
+        description: "Get all lists on a specific Trello board.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            boardId: { type: "string", description: "The Trello board ID." }
+          },
+          required: ["boardId"]
+        }
+      },
+      {
         name: "query_epic_lineage",
         description: "Get the full tree/lineage of an Epic or Sub-Epic by following the 'children' checklists recursively.",
         inputSchema: {
@@ -91,14 +102,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             clientPrefix: { type: "string", description: "Client prefix string for shared boards (e.g., 'Crunch Fitness: ')." },
             parentUrl: { type: "string", description: "URL of the parent Epic or Sub-Epic to link to." },
             idMembers: { type: "array", items: { type: "string" } },
-            idLabels: { type: "array", items: { type: "string" } }
+            idLabels: { type: "array", items: { type: "string" } },
+            startDate: { type: "string", description: "ISO date string for start date (Epics and Sub-Epics only)." },
+            dueDate: { type: "string", description: "ISO date string for due date." }
           },
           required: ["listId", "title"]
         }
       },
       {
         name: "update_card_details",
-        description: "Update the title, description, or schedule (due date) of a card.",
+        description: "Update the title, description, or schedule (due and start dates) of a card.",
         inputSchema: {
           type: "object",
           properties: {
@@ -106,6 +119,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             title: { type: "string" },
             description: { type: "string" },
             dueDate: { type: "string", description: "ISO date string to schedule the card (Trello due date)." },
+            startDate: { type: "string", description: "ISO date string for start date (Epics and Sub-Epics only)." },
             idMembers: { type: "array", items: { type: "string" } },
             idLabels: { type: "array", items: { type: "string" } },
             userNow: { type: "string", description: "User's current ISO date string (for weekly list movement logic)." }
@@ -249,6 +263,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: JSON.stringify(filtered, null, 2) }] };
       }
 
+      case "get_board_lists": {
+        const { boardId } = args as any;
+        const lists = await client.getBoardLists(boardId);
+        return { content: [{ type: "text", text: JSON.stringify(lists, null, 2) }] };
+      }
+
       case "query_epic_lineage": {
         const { epicCardUrlOrId } = args as any;
         const lineage = await semantics.getEpicLineage(epicCardUrlOrId);
@@ -256,12 +276,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "create_card": {
-        const { listId, title, estimate, description, clientPrefix, parentUrl, idMembers, idLabels } = args as any;
+        const { listId, title, estimate, description, clientPrefix, parentUrl, idMembers, idLabels, startDate, dueDate } = args as any;
         let finalTitle = title;
         if (clientPrefix) finalTitle = `${clientPrefix} ${finalTitle}`;
         if (estimate !== undefined) finalTitle = `(${estimate}) ${finalTitle}`;
 
-        const card = await client.createCard(listId, finalTitle, description);
+        // Enforcement: startDate only for Epics/Sub-Epics
+        if (startDate && !semantics.isEpicOrSubEpic(finalTitle)) {
+          throw new Error("Start dates can only be set on Epics or Sub-Epics. Tasks should only have a due date.");
+        }
+
+        const card = await client.createCard(listId, finalTitle, description, dueDate, startDate);
         if (idMembers || idLabels) {
           const updates: any = {};
           if (idMembers) updates.idMembers = idMembers.join(',');
@@ -280,14 +305,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "update_card_details": {
-        const { cardId: rawId, title, description, dueDate, idMembers, idLabels, userNow } = args as any;
+        const { cardId: rawId, title, description, dueDate, startDate, idMembers, idLabels, userNow } = args as any;
         const cardId = semantics.extractCardId(rawId);
         const updates: any = {};
         if (title) updates.name = title;
         if (description) updates.desc = description;
         if (dueDate) updates.due = dueDate;
+        if (startDate) updates.start = startDate;
         if (idMembers) updates.idMembers = idMembers.join(',');
         if (idLabels) updates.idLabels = idLabels.join(',');
+
+        // Enforcement: startDate only for Epics/Sub-Epics
+        if (startDate) {
+          // If title is changing, check the new title. Otherwise, fetch the card to check existing title.
+          const checkTitle = title || (await client.getCard(cardId)).name;
+          if (!semantics.isEpicOrSubEpic(checkTitle)) {
+            throw new Error("Start dates can only be set on Epics or Sub-Epics. Tasks should only have a due date.");
+          }
+        }
         
         // If due date changed, calculate target list
         if (dueDate && userNow) {

@@ -99,12 +99,14 @@ export class TrelloClient {
     });
   }
 
-  async createCard(listId: string, name: string, desc?: string): Promise<TrelloCard> {
+  async createCard(listId: string, name: string, desc?: string, dueDate?: string, startDate?: string): Promise<TrelloCard> {
     return this.handleRequest(async () => {
       const res = await this.axiosInstance.post('/cards', {
         idList: listId,
         name,
-        desc
+        desc,
+        due: dueDate,
+        start: startDate
       });
       return res.data;
     });
