@@ -168,15 +168,13 @@ export class McGawSemantics {
   }
 
   private async cascadeEpicLabel(parent: TrelloCard, child: TrelloCard) {
-    // If parent has an Epic label, apply it to the child
-    // Since epics might just use their name as the label name, we look for labels on the parent
-    // The playbook says: "Each epic has an associated Trello label matching its epic name"
-    // Here we just copy labels from parent to child if the parent is an Epic
-    if (parent.name.includes('EPIC:') || parent.name.includes('SUB-EPIC:')) {
-      const parentBoardLabels = await this.client.getBoardLabels(parent.idBoard);
+    // Inherit labels from parent that start with "EPIC:"
+    const epicLabels = parent.labels.filter(l => l.name?.startsWith('EPIC:'));
+    
+    if (epicLabels.length > 0) {
       const childBoardLabels = await this.client.getBoardLabels(child.idBoard);
       
-      for (const pLabel of parent.labels) {
+      for (const pLabel of epicLabels) {
         // Find matching label by name on child board
         const matchingChildLabel = childBoardLabels.find(l => l.name === pLabel.name);
         if (matchingChildLabel && !child.labels.some(l => l.id === matchingChildLabel.id)) {

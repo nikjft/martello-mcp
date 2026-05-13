@@ -179,4 +179,14 @@ export class TrelloClient {
       return res.data;
     });
   }
+
+  async createLabel(boardId: string, name: string, color: string): Promise<any> {
+    return this.handleRequest(async () => {
+      const res = await this.axiosInstance.post(`/boards/${boardId}/labels`, {
+        name,
+        color
+      });
+      return res.data;
+    });
+  }
 }

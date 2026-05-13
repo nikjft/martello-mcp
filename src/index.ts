@@ -212,6 +212,43 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           required: ["boardId", "query"]
         }
+      },
+      {
+        name: "create_label",
+        description: "Create a new label on a board.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            boardId: { type: "string" },
+            name: { type: "string" },
+            color: { type: "string", enum: ["yellow", "purple", "blue", "red", "green", "orange", "black", "sky", "pink", "lime"] }
+          },
+          required: ["boardId", "name", "color"]
+        }
+      },
+      {
+        name: "add_label_to_card",
+        description: "Add an existing label to a card.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            cardId: { type: "string", description: "Trello card ID, Short Link, or URL." },
+            labelId: { type: "string", description: "The ID of the label to add." }
+          },
+          required: ["cardId", "labelId"]
+        }
+      },
+      {
+        name: "remove_label_from_card",
+        description: "Remove a label from a card.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            cardId: { type: "string", description: "Trello card ID, Short Link, or URL." },
+            labelId: { type: "string", description: "The ID of the label to remove." }
+          },
+          required: ["cardId", "labelId"]
+        }
       }
     ]
   };
@@ -398,6 +435,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           m.username.toLowerCase().includes(q)
         );
         return { content: [{ type: "text", text: JSON.stringify(filtered, null, 2) }] };
+      }
+      
+      case "create_label": {
+        const { boardId, name, color } = args as any;
+        const label = await client.createLabel(boardId, name, color);
+        return { content: [{ type: "text", text: JSON.stringify(label, null, 2) }] };
+      }
+
+      case "add_label_to_card": {
+        const { cardId: rawId, labelId } = args as any;
+        const cardId = semantics.extractCardId(rawId);
+        await client.addLabelToCard(cardId, labelId);
+        return { content: [{ type: "text", text: "Label added successfully." }] };
+      }
+
+      case "remove_label_from_card": {
+        const { cardId: rawId, labelId } = args as any;
+        const cardId = semantics.extractCardId(rawId);
+        await client.removeLabelFromCard(cardId, labelId);
+        return { content: [{ type: "text", text: "Label removed successfully." }] };
       }
 
       default:
