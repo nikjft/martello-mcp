@@ -279,7 +279,7 @@ export class TrelloClient {
   async getCardDetail(cardId: string): Promise<CardDetail> {
     const [card, comments]: [any, CardComment[]] = await Promise.all([
       this.request(`/cards/${encodeURIComponent(cardId)}`, {
-        params: { fields: 'id,name,dueComplete,due,idList,desc', members: 'true' }
+        params: { fields: 'id,name,dueComplete,due,idList,desc,closed', members: 'true' }
       }),
       this.getCardComments(cardId, 14)
     ]);
@@ -299,6 +299,7 @@ export class TrelloClient {
       due: card.due,
       listName,
       desc: card.desc || undefined,
+      closed: Boolean(card.closed),
       comments,
       assignees: (card.members || []).map((m: any) => ({
         id: m.id,
@@ -306,6 +307,55 @@ export class TrelloClient {
         username: m.username
       }))
     };
+  }
+
+  /**
+   * Checks closed/archived status for multiple cards in batches of 10.
+   * Returns a Map of cardId -> isClosed (true = archived/closed, false = active/open).
+   */
+  async getCardsClosedStatus(cardIds: string[]): Promise<Map<string, boolean>> {
+    const statusMap = new Map<string, boolean>();
+    if (cardIds.length === 0) return statusMap;
+
+    const chunkSize = 10;
+    for (let i = 0; i < cardIds.length; i += chunkSize) {
+      const chunk = cardIds.slice(i, i + chunkSize);
+      const urls = chunk.map(id => `/cards/${encodeURIComponent(id)}?fields=closed`).join(',');
+      try {
+        const batchResults = await this.request<any[]>(`/batch`, {
+          params: { urls }
+        });
+
+        if (Array.isArray(batchResults)) {
+          batchResults.forEach((resObj, idx) => {
+            const cardId = chunk[idx];
+            const res200 = resObj?.['200'] || (resObj && typeof resObj.closed === 'boolean' ? resObj : null);
+            if (res200 && typeof res200.closed === 'boolean') {
+              statusMap.set(cardId, Boolean(res200.closed));
+            } else {
+              // 404 or other error -> card deleted or inaccessible, treat as closed
+              statusMap.set(cardId, true);
+            }
+          });
+        }
+      } catch {
+        // Fallback to individual requests if batch fails
+        await Promise.all(
+          chunk.map(async (cardId) => {
+            try {
+              const card = await this.request<any>(`/cards/${encodeURIComponent(cardId)}`, {
+                params: { fields: 'closed' }
+              });
+              statusMap.set(cardId, Boolean(card.closed));
+            } catch {
+              statusMap.set(cardId, true);
+            }
+          })
+        );
+      }
+    }
+
+    return statusMap;
   }
 }
 

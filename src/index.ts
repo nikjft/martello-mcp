@@ -188,7 +188,7 @@ export class MartelloMCP extends McpAgent {
         try {
           checkInit();
           const rawCards = await this.client.searchCards(query);
-          let finalCards = rawCards;
+          let finalCards = rawCards.filter(c => !c.closed);
 
           if (excludeCompletedLists) {
             const boardIds = [...new Set(rawCards.map(c => c.idBoard))];
@@ -606,14 +606,16 @@ export class MartelloMCP extends McpAgent {
           const days = lookback === "7d" ? 7 : lookback === "14d" ? 14 : lookback === "30d" ? 30 : null;
           const cutoff = days ? new Date(Date.now() - days * 86400 * 1000) : null;
 
-          const [me, rawNotifs] = await Promise.all([
+          const [me, openBoards, rawNotifs] = await Promise.all([
             this.client.getCurrentMember().catch(() => null),
+            this.client.getMyBoards().catch(() => []),
             this.client.getNotifications({
               read_filter: (cutoff || lookback === "all") ? "all" : "unread",
               limit: (cutoff || lookback === "all") ? 1000 : 200
             })
           ]);
 
+          const openBoardMap = new Map(openBoards.map(b => [b.id, b.name]));
           const myId = me?.id;
           let filtered = rawNotifs.filter(n => {
             // Exclude self-actions
@@ -626,6 +628,13 @@ export class MartelloMCP extends McpAgent {
             }
             // Cutoff filter
             if (cutoff && new Date(n.date) < cutoff) return false;
+
+            // EXCLUDE CLOSED/ARCHIVED BOARDS:
+            // Only active boards (present in open boards list) are permitted.
+            if (!n.data.board?.id || !openBoardMap.has(n.data.board.id)) {
+              return false;
+            }
+
             return true;
           });
 
@@ -636,6 +645,25 @@ export class MartelloMCP extends McpAgent {
               n.data.board?.id === boardId ||
               (n.data.board?.name && n.data.board.name.toLowerCase().includes(bQuery))
             );
+          }
+
+          // EXCLUDE CLOSED/ARCHIVED CARDS:
+          // Check closed status of all unique cards in the candidate notifications
+          const uniqueCardIds = [...new Set(
+            filtered
+              .map(n => n.data.card?.id)
+              .filter((id): id is string => Boolean(id))
+          )];
+
+          if (uniqueCardIds.length > 0) {
+            const cardClosedMap = await this.client.getCardsClosedStatus(uniqueCardIds);
+            filtered = filtered.filter(n => {
+              const cardId = n.data.card?.id;
+              if (cardId && cardClosedMap.get(cardId) === true) {
+                return false; // Exclude archived/closed card
+              }
+              return true;
+            });
           }
 
           if (groupBy === "flat") {
@@ -797,6 +825,20 @@ export class MartelloMCP extends McpAgent {
 
           cardDetail.associatedNotificationIds = cardNotifs.map(n => n.id);
 
+          if (cardDetail.closed) {
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  isArchived: true,
+                  error: "Card is archived/closed. Only active cards can be triaged.",
+                  card: cardDetail
+                }, null, 2)
+              }],
+              isError: true
+            };
+          }
+
           return {
             content: [{
               type: "text",
@@ -880,6 +922,18 @@ export class MartelloMCP extends McpAgent {
         try {
           checkInit();
           const cardId = this.semantics.extractCardId(rawId);
+
+          const cardDetail = await this.client.getCardDetail(cardId);
+          if (cardDetail.closed) {
+            return {
+              content: [{
+                type: "text",
+                text: `Cannot reply: Card ${cardId} is archived/closed. Only active items can be modified.`
+              }],
+              isError: true
+            };
+          }
+
           await this.client.addComment(cardId, text);
 
           let markedCount = 0;

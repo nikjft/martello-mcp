@@ -13,6 +13,7 @@ export interface TrelloCard {
   due?: string;
   start?: string;
   dueComplete?: boolean;
+  closed?: boolean;
   labels: { id: string; name: string; color: string }[];
   customFieldItems?: { idCustomField: string; value: { date?: string; text?: string; number?: number } }[];
 }
@@ -87,6 +88,7 @@ export interface CardDetail {
   due?: string;
   listName?: string;
   desc?: string;
+  closed?: boolean;
   comments: CardComment[];
   assignees: { id: string; fullName: string; username: string }[];
   associatedNotificationIds?: string[];
