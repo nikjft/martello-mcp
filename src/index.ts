@@ -1030,11 +1030,13 @@ function parseSinceDate(since?: string): Date | null {
       {
         username: z.string().optional().describe("Optional Trello username or member ID. Defaults to the current authenticated user ('me')."),
         since: z.string().optional().default("7d").describe("Filter cards whose recent activity (the latest of card modification date or last notification/comment) is on or after this date. Accepts ISO date string (e.g. '2026-10-01') or relative shorthand ('today', 'yesterday', '24h', '7d', '14d', '30d', or 'all'). Defaults to '7d'."),
+        commentsSince: z.string().optional().describe("Optional date cutoff for comments ('today', 'yesterday', '24h', '7d', etc. or ISO string). Defaults to the same value as 'since'. Only comments on or after this date will be included, capped at 3."),
         boardId: z.string().optional().describe("Optional board ID or name substring to filter cards to a specific active board."),
-        includeComments: z.boolean().optional().default(true).describe("Whether to fetch recent comment thread for each returned card (default true)."),
-        limit: z.number().optional().default(50).describe("Maximum number of cards to return (default 50).")
+        includeComments: z.boolean().optional().default(true).describe("Whether to fetch recent non-empty comments for each card, capped at 3 (default true)."),
+        cursor: z.union([z.number(), z.string()]).optional().default(0).describe("Zero-based pagination cursor / offset. Defaults to 0. Use 'nextCursor' from previous response to fetch the next page."),
+        limit: z.number().optional().default(50).describe("Maximum number of cards to return per page (default 50).")
       },
-      async ({ username, since, boardId, includeComments, limit }) => {
+      async ({ username, since, commentsSince, boardId, includeComments, cursor, limit }) => {
         try {
           checkInit();
 
@@ -1046,12 +1048,12 @@ function parseSinceDate(since?: string): Date | null {
             this.client.getNotifications({ read_filter: "all", limit: 1000 }).catch(() => [])
           ]);
 
-          const openBoardIds = new Set(openBoards.filter(b => !b.closed).map(b => b.id));
+          const openBoardMap = new Map(openBoards.filter(b => !b.closed).map(b => [b.id, b.name]));
 
           // Exclude closed cards, cards on closed boards, or cards in closed lists
           let activeCards = rawCards.filter(c => {
             if (c.closed) return false;
-            if (!c.idBoard || !openBoardIds.has(c.idBoard)) return false;
+            if (!c.idBoard || !openBoardMap.has(c.idBoard)) return false;
             if (c.board && c.board.closed) return false;
             if (c.list && c.list.closed) return false;
             return true;
@@ -1062,12 +1064,13 @@ function parseSinceDate(since?: string): Date | null {
             const bQuery = boardId.toLowerCase();
             activeCards = activeCards.filter(c =>
               c.idBoard === boardId ||
-              (c.board?.name && c.board.name.toLowerCase().includes(bQuery))
+              (c.board?.name && c.board.name.toLowerCase().includes(bQuery)) ||
+              (openBoardMap.get(c.idBoard)?.toLowerCase().includes(bQuery))
             );
           }
 
           // Map notifications to cards for latest interaction timestamp & unread flag
-          const notifByCard = new Map<string, { latestDate: string; count: number; unread: boolean; latestSnippet?: string; latestAuthor?: string }>();
+          const notifByCard = new Map<string, { latestDate: string; count: number; unread: boolean; latestSnippet?: string; latestAuthor?: string; latestAuthorUsername?: string }>();
           for (const n of notifications) {
             const cid = n.data.card?.id;
             if (!cid) continue;
@@ -1078,7 +1081,8 @@ function parseSinceDate(since?: string): Date | null {
                 count: (existing?.count || 0) + 1,
                 unread: existing?.unread || n.unread,
                 latestSnippet: n.data.text,
-                latestAuthor: n.memberCreator?.fullName || n.memberCreator?.username
+                latestAuthor: n.memberCreator?.fullName || n.memberCreator?.username,
+                latestAuthorUsername: n.memberCreator?.username
               });
             } else {
               existing.count++;
@@ -1102,11 +1106,12 @@ function parseSinceDate(since?: string): Date | null {
               id: c.id,
               name: c.name,
               boardId: c.idBoard,
-              boardName: c.board?.name,
+              boardName: openBoardMap.get(c.idBoard) || c.board?.name || "Unknown Board",
               listId: c.idList,
-              listName: c.list?.name,
+              listName: "Unknown List", // populated below for paginated slice
+              isInReviewList: false, // populated below for paginated slice
               due: c.due,
-              dueComplete: c.dueComplete,
+              dueComplete: c.dueComplete ?? false,
               dateLastActivity: c.dateLastActivity,
               latestActivityDate,
               activitySource,
@@ -1138,18 +1143,95 @@ function parseSinceDate(since?: string): Date | null {
             return tB - tA;
           });
 
-          const limitedCards = filteredCards.slice(0, limit);
+          // Pagination logic
+          const offset = typeof cursor === "number" ? cursor : (parseInt(cursor || "0", 10) || 0);
+          const paginatedCards = filteredCards.slice(offset, offset + limit);
+          const nextCursor = (offset + paginatedCards.length < filteredCards.length) ? (offset + paginatedCards.length) : null;
+          const hasMore = nextCursor !== null;
 
-          if (includeComments) {
-            await Promise.all(
-              limitedCards.map(async (card: any) => {
+          const truncatedWarning = hasMore
+            ? `WARNING: Results truncated! Found ${filteredCards.length} matching cards, returning ${paginatedCards.length} (offset ${offset}). To retrieve the remaining ${filteredCards.length - (offset + paginatedCards.length)} cards, call get_personal_cards with cursor: ${nextCursor}.`
+            : undefined;
+
+          // Batch fetch list metadata and latest action for paginated cards
+          const uniqueListIds = [...new Set(paginatedCards.map(c => c.listId).filter((id): id is string => Boolean(id)))];
+          const paginatedCardIds = paginatedCards.map(c => c.id);
+
+          const [listMap, latestActionsMap] = await Promise.all([
+            this.client.getListsByIds(uniqueListIds),
+            this.client.getCardsLatestAction(paginatedCardIds)
+          ]);
+
+          const myUsername = member.username?.toLowerCase();
+          const myFullName = member.fullName?.toLowerCase();
+
+          // Populate listName, isInReviewList, actor metadata, and comments
+          const commentsCutoff = parseSinceDate(commentsSince || since);
+
+          await Promise.all(
+            paginatedCards.map(async (card: any) => {
+              // 1. List name & review status
+              if (card.listId && listMap.has(card.listId)) {
+                const listInfo = listMap.get(card.listId)!;
+                card.listName = listInfo.name;
+                card.isInReviewList = listInfo.name.toLowerCase().includes("review");
+              }
+
+              // 2. Identify actor for last modification & filter noise
+              const action = latestActionsMap.get(card.id);
+              const notif = notifByCard.get(card.id);
+
+              let actor = "Unknown";
+              let actorUsername = "";
+              let isAutomation = false;
+              let isSelf = false;
+              let lastActionType = action?.type;
+
+              if (action) {
+                actor = action.actorName;
+                actorUsername = action.actorUsername;
+                isAutomation = action.isAutomation;
+              } else if (notif?.latestAuthor) {
+                actor = notif.latestAuthor;
+                actorUsername = notif.latestAuthorUsername || "";
+                const lower = `${actor} ${actorUsername}`.toLowerCase();
+                isAutomation = lower.includes("automation") || lower.includes("butler") || lower.includes("bot");
+              }
+
+              // Check if actor is current user (Nik)
+              if (actorUsername && myUsername && actorUsername.toLowerCase() === myUsername) {
+                isSelf = true;
+              } else if (myFullName && actor.toLowerCase() === myFullName) {
+                isSelf = true;
+              } else if (actor.toLowerCase().includes("nik")) {
+                isSelf = true;
+              }
+
+              // Check automated Sunday due-date roll (touched around 12:30 UTC on Sunday)
+              if (!isAutomation && card.dateLastActivity) {
+                const modDate = new Date(card.dateLastActivity);
+                if (modDate.getUTCDay() === 0 && modDate.getUTCHours() === 12 && modDate.getUTCMinutes() >= 28 && modDate.getUTCMinutes() <= 33) {
+                  isAutomation = true;
+                }
+              }
+
+              card.actor = actor;
+              card.actorUsername = actorUsername || undefined;
+              card.isAutomation = isAutomation;
+              card.isSelf = isSelf;
+              card.lastActionType = lastActionType;
+
+              // 3. Comments (capped at 3, filtered by commentsCutoff, empty comments stripped)
+              if (includeComments) {
                 try {
-                  const comments = await this.client.getCardComments(card.id, 5);
+                  const comments = await this.client.getCardComments(card.id, 3, commentsCutoff);
                   card.recentComments = comments;
-                } catch {}
-              })
-            );
-          }
+                } catch {
+                  card.recentComments = [];
+                }
+              }
+            })
+          );
 
           const output = {
             member: {
@@ -1158,9 +1240,14 @@ function parseSinceDate(since?: string): Date | null {
               fullName: member.fullName
             },
             sinceFilter: sinceDate ? sinceDate.toISOString() : "all",
+            commentsSinceFilter: commentsCutoff ? commentsCutoff.toISOString() : "all",
             totalActiveCardsFound: filteredCards.length,
-            cardsReturned: limitedCards.length,
-            cards: limitedCards
+            cardsReturned: paginatedCards.length,
+            cursor: offset,
+            nextCursor,
+            hasMore,
+            truncatedWarning,
+            cards: paginatedCards
           };
 
           return { content: [{ type: "text", text: JSON.stringify(output, null, 2) }] };
