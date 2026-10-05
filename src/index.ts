@@ -5,11 +5,18 @@ import { z } from "zod";
 import { TrelloClient } from "./trello-client.js";
 import { McGawSemantics } from "./semantics.js";
 
+import {
+  PendingAuthRequest,
+  StoredAuthCode,
+  StoredSession,
+  verifyPkce
+} from "./oauth.js";
+
 export class MartelloMCP extends McpAgent {
   server = new McpServer({
     name: "mcgaw-trello-mcp",
     version: "1.0.0",
-    description: "Martello MCP: McGaw Trello Project Management server running on Cloudflare Workers"
+    description: "Martello MCP: McGaw Trello Project Management server running on Cloudflare Workers with OAuth 2.0"
   });
 
   private client!: TrelloClient;
@@ -19,6 +26,113 @@ export class MartelloMCP extends McpAgent {
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
     this.workerEnv = env;
+  }
+
+  // --- RPC Methods for OAuth State & Session Management ---
+
+  async storePendingAuth(data: PendingAuthRequest): Promise<boolean> {
+    await this.ctx.storage.put("pending:" + data.nonce, data);
+    return true;
+  }
+
+  async getPendingAuth(nonce: string): Promise<PendingAuthRequest | null> {
+    const data = await this.ctx.storage.get<PendingAuthRequest>("pending:" + nonce);
+    if (!data) return null;
+    await this.ctx.storage.delete("pending:" + nonce);
+    if (data.expiresAt < Date.now()) return null;
+    return data;
+  }
+
+  async storeAuthCode(data: StoredAuthCode): Promise<boolean> {
+    await this.ctx.storage.put("code:" + data.code, data);
+    return true;
+  }
+
+  async exchangeAuthCode(code: string, codeVerifier: string): Promise<any> {
+    const stored = await this.ctx.storage.get<StoredAuthCode>("code:" + code);
+    if (!stored) {
+      return { status: 400, data: { error: "invalid_grant", error_description: "Authorization code not found or expired" } };
+    }
+    if (stored.expiresAt < Date.now()) {
+      await this.ctx.storage.delete("code:" + code);
+      return { status: 400, data: { error: "invalid_grant", error_description: "Authorization code expired" } };
+    }
+
+    const validPkce = await verifyPkce(codeVerifier, stored.codeChallenge, stored.codeChallengeMethod);
+    if (!validPkce) {
+      return { status: 400, data: { error: "invalid_grant", error_description: "PKCE verification failed" } };
+    }
+
+    await this.ctx.storage.delete("code:" + code);
+
+    const mcpAccessToken = "mcp_at_" + crypto.randomUUID().replace(/-/g, "");
+    const mcpRefreshToken = "mcp_rt_" + crypto.randomUUID().replace(/-/g, "");
+
+    const session: StoredSession = {
+      mcpAccessToken,
+      mcpRefreshToken,
+      trelloToken: stored.trelloToken,
+      expiresAt: Date.now() + 30 * 24 * 3600 * 1000,
+      createdAt: Date.now()
+    };
+
+    await this.ctx.storage.put("session:" + mcpAccessToken, session);
+    await this.ctx.storage.put("refresh:" + mcpRefreshToken, mcpAccessToken);
+
+    return {
+      status: 200,
+      data: {
+        access_token: mcpAccessToken,
+        token_type: "Bearer",
+        expires_in: 2592000,
+        refresh_token: mcpRefreshToken
+      }
+    };
+  }
+
+  async refreshMcpSession(refreshToken: string): Promise<any> {
+    const tokenKey = await this.ctx.storage.get<string>("refresh:" + refreshToken);
+    if (!tokenKey) {
+      return { status: 400, data: { error: "invalid_grant", error_description: "Invalid refresh token" } };
+    }
+
+    const session = await this.ctx.storage.get<StoredSession>("session:" + tokenKey);
+    if (!session) {
+      return { status: 400, data: { error: "invalid_grant", error_description: "Session not found" } };
+    }
+
+    const newAccessToken = "mcp_at_" + crypto.randomUUID().replace(/-/g, "");
+    session.mcpAccessToken = newAccessToken;
+    session.expiresAt = Date.now() + 30 * 24 * 3600 * 1000;
+
+    await this.ctx.storage.delete("session:" + tokenKey);
+    await this.ctx.storage.put("session:" + newAccessToken, session);
+    await this.ctx.storage.put("refresh:" + refreshToken, newAccessToken);
+
+    return {
+      status: 200,
+      data: {
+        access_token: newAccessToken,
+        token_type: "Bearer",
+        expires_in: 2592000,
+        refresh_token: refreshToken
+      }
+    };
+  }
+
+  async resolveSession(token: string): Promise<{ valid: boolean; trelloToken?: string }> {
+    const session = await this.ctx.storage.get<StoredSession>("session:" + token);
+    if (!session) {
+      return { valid: false };
+    }
+    if (session.expiresAt < Date.now()) {
+      await this.ctx.storage.delete("session:" + token);
+      return { valid: false };
+    }
+    return {
+      valid: true,
+      trelloToken: session.trelloToken
+    };
   }
 
   async init() {
@@ -31,10 +145,16 @@ export class MartelloMCP extends McpAgent {
     }
 
     const checkInit = () => {
-      if (!this.client || !this.semantics) {
-        throw new Error(
-          "Trello client not initialized. Please ensure TRELLO_API_KEY and TRELLO_TOKEN secrets are configured."
-        );
+      if (!this.client || (this.workerEnv?.TRELLO_TOKEN && (this.client as any).token !== this.workerEnv.TRELLO_TOKEN)) {
+        if (this.workerEnv?.TRELLO_API_KEY && this.workerEnv?.TRELLO_TOKEN) {
+          this.client = new TrelloClient({
+            apiKey: this.workerEnv.TRELLO_API_KEY,
+            token: this.workerEnv.TRELLO_TOKEN,
+          });
+          this.semantics = new McGawSemantics(this.client);
+        } else {
+          throw new Error("Trello client not initialized. Please connect via OAuth or configure credentials.");
+        }
       }
     };
 
@@ -452,20 +572,420 @@ export class MartelloMCP extends McpAgent {
   }
 }
 
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS, HEAD",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, mcp-session-id, mcp-protocol-version, x-requested-with, x-admin-auth",
+  "Access-Control-Expose-Headers": "mcp-session-id, WWW-Authenticate, Authorization"
+};
+
+const CALLBACK_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Connecting Trello to Claude...</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      background: #0f172a;
+      color: #f8fafc;
+    }
+    .card {
+      background: #1e293b;
+      padding: 2.5rem;
+      border-radius: 16px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+      text-align: center;
+      max-width: 420px;
+      border: 1px solid #334155;
+    }
+    h2 { margin: 0 0 0.5rem 0; font-size: 1.5rem; }
+    p { color: #94a3b8; font-size: 0.95rem; margin: 0.5rem 0 1.5rem 0; }
+    .spinner {
+      border: 3px solid #334155;
+      border-top: 3px solid #38bdf8;
+      border-radius: 50%;
+      width: 40px;
+      height: 40px;
+      animation: spin 1s linear infinite;
+      margin: 1.5rem auto;
+    }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Connecting Trello</h2>
+    <div class="spinner"></div>
+    <p id="status">Completing authorization with Claude...</p>
+  </div>
+  <script>
+    async function handleAuth() {
+      const hash = window.location.hash.substring(1);
+      const hashParams = new URLSearchParams(hash);
+      const token = hashParams.get('token');
+
+      const urlParams = new URLSearchParams(window.location.search);
+      const nonce = urlParams.get('nonce');
+
+      if (!token) {
+        document.getElementById('status').innerText = 'Authorization was denied or no token was returned. Please close this window and try again.';
+        return;
+      }
+
+      try {
+        const res = await fetch('/oauth/trello-token-submit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token, nonce })
+        });
+        const data = await res.json();
+        if (data.redirect) {
+          window.location.href = data.redirect;
+        } else {
+          document.getElementById('status').innerText = 'Error: ' + (data.error || 'Failed to complete authorization');
+        }
+      } catch (err) {
+        document.getElementById('status').innerText = 'Network error: ' + err.message;
+      }
+    }
+    handleAuth();
+  </script>
+</body>
+</html>`;
+
 export default {
-  fetch(request: Request, env: Env, ctx: ExecutionContext) {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname === "/sse" || url.pathname === "/sse/message") {
-      return MartelloMCP.serveSSE("/sse").fetch(request, env, ctx);
+    // 0. Handle CORS preflight
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
-    if (url.pathname === "/mcp") {
-      return MartelloMCP.serve("/mcp").fetch(request, env, ctx);
+    // 1a. RFC 9728 Protected Resource Metadata
+    if (
+      url.pathname === "/.well-known/oauth-protected-resource" ||
+      url.pathname.startsWith("/.well-known/oauth-protected-resource/") ||
+      url.pathname.endsWith("/.well-known/oauth-protected-resource")
+    ) {
+      const resource = url.origin;
+      return Response.json(
+        {
+          resource,
+          authorization_servers: [url.origin],
+          scopes_supported: [],
+          bearer_methods_supported: ["header"]
+        },
+        {
+          headers: {
+            ...CORS_HEADERS,
+            "Content-Type": "application/json"
+          }
+        }
+      );
     }
 
+    // 1b. RFC 8414 OAuth 2.0 Authorization Server Metadata
+    if (url.pathname === "/.well-known/oauth-authorization-server" || url.pathname === "/.well-known/openid-configuration") {
+      const metadata = {
+        issuer: url.origin,
+        authorization_endpoint: `${url.origin}/oauth/authorize`,
+        token_endpoint: `${url.origin}/oauth/token`,
+        registration_endpoint: `${url.origin}/oauth/register`,
+        response_types_supported: ["code"],
+        grant_types_supported: ["authorization_code", "refresh_token"],
+        code_challenge_methods_supported: ["S256"],
+        token_endpoint_auth_methods_supported: ["none", "client_secret_post", "client_secret_basic"]
+      };
+      return Response.json(metadata, {
+        headers: {
+          ...CORS_HEADERS,
+          "Content-Type": "application/json"
+        }
+      });
+    }
+
+    // 1c. RFC 7591 Dynamic Client Registration (/oauth/register)
+    if (url.pathname === "/oauth/register") {
+      if (request.method !== "POST") {
+        return new Response("Method Not Allowed", { status: 405, headers: CORS_HEADERS });
+      }
+
+      let body: any = {};
+      try {
+        body = await request.json();
+      } catch {
+        body = {};
+      }
+
+      const clientId = "client_" + crypto.randomUUID().replace(/-/g, "");
+      const clientSecret = "cs_" + crypto.randomUUID().replace(/-/g, "");
+
+      const registrationResponse = {
+        client_id: clientId,
+        client_secret: clientSecret,
+        client_name: body.client_name || "Claude",
+        redirect_uris: body.redirect_uris || [
+          "https://claude.ai/api/mcp/auth_callback",
+          "https://claude.ai/api/mcp/oauth_callback"
+        ],
+        grant_types: body.grant_types || ["authorization_code", "refresh_token"],
+        response_types: body.response_types || ["code"],
+        token_endpoint_auth_method: body.token_endpoint_auth_method || "none"
+      };
+
+      return Response.json(registrationResponse, {
+        status: 201,
+        headers: {
+          ...CORS_HEADERS,
+          "Content-Type": "application/json"
+        }
+      });
+    }
+
+    // 2. OAuth 2.0 Authorization Endpoint (/oauth/authorize)
+    if (url.pathname === "/oauth/authorize") {
+      const clientId = url.searchParams.get("client_id") || "claude";
+      const redirectUri = url.searchParams.get("redirect_uri");
+      const state = url.searchParams.get("state") || "";
+      const codeChallenge = url.searchParams.get("code_challenge");
+      const codeChallengeMethod = url.searchParams.get("code_challenge_method") || "S256";
+
+      if (!redirectUri || !codeChallenge) {
+        return new Response("Missing redirect_uri or code_challenge parameter", { status: 400 });
+      }
+
+      if (!env.TRELLO_API_KEY) {
+        return new Response("Server configuration error: TRELLO_API_KEY missing", { status: 500 });
+      }
+
+      const nonce = crypto.randomUUID().replace(/-/g, "");
+      const stub = env.MCP_OBJECT.get(env.MCP_OBJECT.idFromName("oauth-storage"));
+
+      await (stub as any).storePendingAuth({
+        nonce,
+        redirectUri,
+        clientState: state,
+        codeChallenge,
+        codeChallengeMethod,
+        clientId,
+        expiresAt: Date.now() + 10 * 60 * 1000
+      });
+
+      const returnUrl = `${url.origin}/oauth/trello-callback?nonce=${nonce}`;
+      const trelloAuthUrl = new URL("https://trello.com/1/authorize");
+      trelloAuthUrl.searchParams.set("key", env.TRELLO_API_KEY);
+      trelloAuthUrl.searchParams.set("name", "Martello MCP");
+      trelloAuthUrl.searchParams.set("response_type", "token");
+      trelloAuthUrl.searchParams.set("scope", "read,write");
+      trelloAuthUrl.searchParams.set("expiration", "never");
+      trelloAuthUrl.searchParams.set("return_url", returnUrl);
+      trelloAuthUrl.searchParams.set("callback_method", "fragment");
+
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location: trelloAuthUrl.toString(),
+          "Set-Cookie": `mcp_auth_nonce=${nonce}; Path=/oauth; Max-Age=600; Secure; SameSite=Lax`
+        }
+      });
+    }
+
+    // 3. Trello Token Callback Bridge Page (/oauth/trello-callback)
+    if (url.pathname === "/oauth/trello-callback") {
+      return new Response(CALLBACK_HTML, {
+        status: 200,
+        headers: { "Content-Type": "text/html; charset=utf-8" }
+      });
+    }
+
+    // 3b. Trello Token Submit API (/oauth/trello-token-submit)
+    if (url.pathname === "/oauth/trello-token-submit") {
+      if (request.method !== "POST") {
+        return new Response("Method Not Allowed", { status: 405, headers: CORS_HEADERS });
+      }
+
+      let body: any = {};
+      try {
+        body = await request.json();
+      } catch {
+        body = {};
+      }
+
+      const token = body.token;
+      let nonce = body.nonce;
+
+      if (!nonce) {
+        const cookie = request.headers.get("Cookie") || "";
+        const match = cookie.match(/mcp_auth_nonce=([a-zA-Z0-9_-]+)/);
+        if (match) nonce = match[1];
+      }
+
+      if (!token || !nonce) {
+        return Response.json(
+          { error: "invalid_request", error_description: "Missing token or authorization nonce" },
+          { status: 400, headers: CORS_HEADERS }
+        );
+      }
+
+      const stub = env.MCP_OBJECT.get(env.MCP_OBJECT.idFromName("oauth-storage"));
+      const pending = await (stub as any).getPendingAuth(nonce);
+
+      if (!pending) {
+        return Response.json(
+          { error: "invalid_grant", error_description: "Authorization session expired. Please start again." },
+          { status: 400, headers: CORS_HEADERS }
+        );
+      }
+
+      const authCode = crypto.randomUUID();
+      await (stub as any).storeAuthCode({
+        code: authCode,
+        codeChallenge: pending.codeChallenge,
+        codeChallengeMethod: pending.codeChallengeMethod,
+        trelloToken: token,
+        expiresAt: Date.now() + 10 * 60 * 1000
+      });
+
+      const returnUrl = new URL(pending.redirectUri);
+      returnUrl.searchParams.set("code", authCode);
+      if (pending.clientState) {
+        returnUrl.searchParams.set("state", pending.clientState);
+      }
+
+      return Response.json({ redirect: returnUrl.toString() }, { headers: CORS_HEADERS });
+    }
+
+    // 4. OAuth 2.0 Token Endpoint (/oauth/token)
+    if (url.pathname === "/oauth/token") {
+      if (request.method !== "POST") {
+        return new Response("Method Not Allowed", { status: 405 });
+      }
+
+      let params: Record<string, string> = {};
+      const contentType = request.headers.get("content-type") || "";
+      if (contentType.includes("application/x-www-form-urlencoded")) {
+        const text = await request.text();
+        const search = new URLSearchParams(text);
+        for (const [k, v] of search.entries()) {
+          params[k] = v;
+        }
+      } else {
+        try {
+          params = await request.json();
+        } catch {
+          params = {};
+        }
+      }
+
+      const grantType = params.grant_type;
+      const stub = env.MCP_OBJECT.get(env.MCP_OBJECT.idFromName("oauth-storage"));
+
+      if (grantType === "authorization_code") {
+        const code = params.code;
+        const codeVerifier = params.code_verifier;
+        if (!code || !codeVerifier) {
+          return Response.json(
+            { error: "invalid_request", error_description: "Missing code or code_verifier" },
+            { status: 400, headers: CORS_HEADERS }
+          );
+        }
+
+        const res = await (stub as any).exchangeAuthCode(code, codeVerifier);
+        return Response.json(res.data, { status: res.status, headers: CORS_HEADERS });
+      }
+
+      if (grantType === "refresh_token") {
+        const refreshToken = params.refresh_token;
+        if (!refreshToken) {
+          return Response.json(
+            { error: "invalid_request", error_description: "Missing refresh_token" },
+            { status: 400, headers: CORS_HEADERS }
+          );
+        }
+
+        const res = await (stub as any).refreshMcpSession(refreshToken);
+        return Response.json(res.data, { status: res.status, headers: CORS_HEADERS });
+      }
+
+      return Response.json(
+        { error: "unsupported_grant_type", error_description: "Supported: authorization_code, refresh_token" },
+        { status: 400, headers: CORS_HEADERS }
+      );
+    }
+
+    // 5. MCP Transport Endpoints (/sse, /sse/message, /mcp, or root MCP probe)
+    const isMcpPath = url.pathname === "/sse" || url.pathname === "/sse/message" || url.pathname === "/mcp";
+    const isRootMcpProbe = url.pathname === "/" && !request.headers.get("Accept")?.includes("text/html");
+
+    if (isMcpPath || isRootMcpProbe) {
+      let activeTrelloToken = "";
+
+      const authHeader = request.headers.get("Authorization");
+      if (authHeader?.startsWith("Bearer ")) {
+        const token = authHeader.slice(7).trim();
+        const stub = env.MCP_OBJECT.get(env.MCP_OBJECT.idFromName("oauth-storage"));
+
+        const res = await (stub as any).resolveSession(token);
+        if (res?.valid && res.trelloToken) {
+          activeTrelloToken = res.trelloToken;
+        }
+      }
+
+      // Allow fallback PAT if explicitly requested (?auth=admin or X-Admin-Auth)
+      const allowPat = request.headers.get("X-Admin-Auth") === "true" || url.searchParams.get("auth") === "admin";
+      if (!activeTrelloToken && allowPat && env.TRELLO_TOKEN) {
+        activeTrelloToken = env.TRELLO_TOKEN;
+      }
+
+      // If no valid session: Challenge client with RFC 9728 401 WWW-Authenticate
+      if (!activeTrelloToken) {
+        return new Response(
+          JSON.stringify({
+            error: "unauthorized",
+            message: "Authentication required. Please connect via OAuth 2.0."
+          }),
+          {
+            status: 401,
+            headers: {
+              ...CORS_HEADERS,
+              "Content-Type": "application/json",
+              "WWW-Authenticate": `Bearer resource_metadata="${url.origin}/.well-known/oauth-protected-resource"`
+            }
+          }
+        );
+      }
+
+      // Provide scoped env with the active user's Trello token
+      const scopedEnv: Env = {
+        ...env,
+        TRELLO_TOKEN: activeTrelloToken
+      };
+
+      if (url.pathname === "/mcp" || (isRootMcpProbe && request.method === "POST")) {
+        return MartelloMCP.serve("/mcp", { corsOptions: { origin: "*" } }).fetch(request, scopedEnv, ctx);
+      }
+
+      return MartelloMCP.serveSSE("/sse", { corsOptions: { origin: "*" } }).fetch(request, scopedEnv, ctx);
+    }
+
+    // Default root welcome / diagnostic info
     return new Response(
-      "Martello MCP Server (Cloudflare Worker) - Available endpoints: /sse, /mcp",
+      `Martello MCP Server (Cloudflare Worker with OAuth 2.0)
+Available endpoints:
+  - SSE MCP: /sse
+  - Streamable MCP: /mcp
+  - OAuth Discovery: /.well-known/oauth-authorization-server
+  - OAuth Protected Resource: /.well-known/oauth-protected-resource
+  - OAuth Authorize: /oauth/authorize
+  - OAuth Token: /oauth/token`,
       {
         status: 200,
         headers: { "Content-Type": "text/plain" }
@@ -473,3 +993,4 @@ export default {
     );
   }
 };
+
