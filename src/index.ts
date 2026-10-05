@@ -187,11 +187,15 @@ export class MartelloMCP extends McpAgent {
       async ({ query, excludeCompletedLists }) => {
         try {
           checkInit();
-          const rawCards = await this.client.searchCards(query);
-          let finalCards = rawCards.filter(c => !c.closed);
+          const [rawCards, openBoards] = await Promise.all([
+            this.client.searchCards(query),
+            this.client.getMyBoards()
+          ]);
+          const openBoardIds = new Set(openBoards.filter(b => !b.closed).map(b => b.id));
+          let finalCards = rawCards.filter(c => !c.closed && openBoardIds.has(c.idBoard));
 
           if (excludeCompletedLists) {
-            const boardIds = [...new Set(rawCards.map(c => c.idBoard))];
+            const boardIds = [...new Set(finalCards.map(c => c.idBoard))];
             const listsMap = new Map<string, string>();
             for (const bid of boardIds) {
               const lists = await this.client.getBoardLists(bid);
@@ -199,7 +203,7 @@ export class MartelloMCP extends McpAgent {
                 listsMap.set(l.id, l.name.toLowerCase());
               }
             }
-            finalCards = rawCards.filter(c => {
+            finalCards = finalCards.filter(c => {
               const lname = listsMap.get(c.idList);
               if (!lname) return true;
               return !lname.includes("completed") && !lname.includes("template");
@@ -228,9 +232,10 @@ export class MartelloMCP extends McpAgent {
         try {
           checkInit();
           const boards = await this.client.getMyBoards();
+          const activeBoards = boards.filter(b => !b.closed);
           const filtered = nameFilter
-            ? boards.filter(b => b.name.toLowerCase().includes(nameFilter.toLowerCase()))
-            : boards;
+            ? activeBoards.filter(b => b.name.toLowerCase().includes(nameFilter.toLowerCase()))
+            : activeBoards;
           return { content: [{ type: "text", text: JSON.stringify(filtered, null, 2) }] };
         } catch (error: any) {
           return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
@@ -264,7 +269,9 @@ export class MartelloMCP extends McpAgent {
       async ({ epicCardUrlOrId }) => {
         try {
           checkInit();
-          const lineage = await this.semantics.getEpicLineage(epicCardUrlOrId);
+          const cardId = this.semantics.extractCardId(epicCardUrlOrId);
+          await this.client.ensureActiveCard(cardId);
+          const lineage = await this.semantics.getEpicLineage(cardId);
           return { content: [{ type: "text", text: JSON.stringify(lineage, null, 2) }] };
         } catch (error: any) {
           return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
@@ -301,6 +308,15 @@ export class MartelloMCP extends McpAgent {
       }) => {
         try {
           checkInit();
+          const list = await this.client.getList(listId);
+          if (list.closed) {
+            throw new Error(`Cannot create card in closed/archived list ${listId}.`);
+          }
+          const openBoards = await this.client.getMyBoards();
+          if (!openBoards.some(b => b.id === list.idBoard)) {
+            throw new Error(`Cannot create card on closed/archived board ${list.idBoard}.`);
+          }
+
           let finalTitle = title;
           if (clientPrefix) finalTitle = `${clientPrefix} ${finalTitle}`;
           if (estimate !== undefined) finalTitle = `(${estimate}) ${finalTitle}`;
@@ -320,7 +336,7 @@ export class MartelloMCP extends McpAgent {
           if (parentUrl) {
             const parentMatch = /https:\/\/trello\.com\/c\/([A-Za-z0-9]+)/i.exec(parentUrl);
             const parentId = parentMatch ? parentMatch[1] : parentUrl;
-            const parentCard = await this.client.getCard(parentId);
+            const parentCard = await this.client.ensureActiveCard(parentId);
             await this.semantics.updateRelationship(parentCard, card, "parent-child", "link");
           }
 
@@ -439,6 +455,11 @@ export class MartelloMCP extends McpAgent {
         try {
           checkInit();
           const cardId = this.semantics.extractCardId(rawId);
+          await this.client.ensureActiveCard(cardId);
+          const targetList = await this.client.getList(listId);
+          if (targetList.closed) {
+            throw new Error(`Cannot move card to closed/archived list ${listId}.`);
+          }
           const updated = await this.client.updateCard(cardId, { idList: listId });
           return { content: [{ type: "text", text: JSON.stringify(updated, null, 2) }] };
         } catch (error: any) {
@@ -458,6 +479,11 @@ export class MartelloMCP extends McpAgent {
         try {
           checkInit();
           const cardId = this.semantics.extractCardId(rawId);
+          await this.client.ensureActiveCard(cardId);
+          const reviewList = await this.client.getList(reviewListId);
+          if (reviewList.closed) {
+            throw new Error(`Cannot complete card into closed/archived Review list ${reviewListId}.`);
+          }
           const updated = await this.client.updateCard(cardId, { idList: reviewListId, dueComplete: true });
           return { content: [{ type: "text", text: JSON.stringify(updated, null, 2) }] };
         } catch (error: any) {
@@ -480,8 +506,10 @@ export class MartelloMCP extends McpAgent {
           checkInit();
           const sourceId = this.semantics.extractCardId(rawSource);
           const targetId = this.semantics.extractCardId(rawTarget);
-          const sourceCard = await this.client.getCard(sourceId);
-          const targetCard = await this.client.getCard(targetId);
+          const [sourceCard, targetCard] = await Promise.all([
+            this.client.ensureActiveCard(sourceId),
+            this.client.ensureActiveCard(targetId)
+          ]);
           await this.semantics.updateRelationship(sourceCard, targetCard, relationshipType, action);
           return { content: [{ type: "text", text: "Successfully updated relationship." }] };
         } catch (error: any) {
@@ -959,6 +987,178 @@ export class MartelloMCP extends McpAgent {
               }, null, 2)
             }]
           };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
+      }
+    );
+
+    // 21. get_personal_cards (lookup delta/changes for personal or specific user cards)
+    this.server.tool(
+      "get_personal_cards",
+      {
+        username: z.string().optional().describe("Optional Trello username or member ID. Defaults to the current authenticated user ('me')."),
+        since: z.string().optional().default("7d").describe("Filter cards whose recent activity (the latest of card modification date or last notification/comment) is on or after this date. Accepts ISO date string (e.g. '2026-10-01') or relative shorthand ('today', 'yesterday', '24h', '7d', '14d', '30d', or 'all'). Defaults to '7d'."),
+        boardId: z.string().optional().describe("Optional board ID or name substring to filter cards to a specific active board."),
+        includeComments: z.boolean().optional().default(true).describe("Whether to fetch recent comment thread for each returned card (default true)."),
+        limit: z.number().optional().default(50).describe("Maximum number of cards to return (default 50).")
+      },
+      async ({ username, since, boardId, includeComments, limit }) => {
+        try {
+          checkInit();
+
+          const targetUser = username || "me";
+          const [member, openBoards, rawCards, notifications] = await Promise.all([
+            this.client.getMember(targetUser),
+            this.client.getMyBoards(),
+            this.client.getMemberCards(targetUser),
+            this.client.getNotifications({ read_filter: "all", limit: 1000 }).catch(() => [])
+          ]);
+
+          const openBoardIds = new Set(openBoards.filter(b => !b.closed).map(b => b.id));
+
+          // Exclude closed cards, cards on closed boards, or cards in closed lists
+          let activeCards = rawCards.filter(c => {
+            if (c.closed) return false;
+            if (!c.idBoard || !openBoardIds.has(c.idBoard)) return false;
+            if (c.board && c.board.closed) return false;
+            if (c.list && c.list.closed) return false;
+            return true;
+          });
+
+          // Optional board filter
+          if (boardId) {
+            const bQuery = boardId.toLowerCase();
+            activeCards = activeCards.filter(c =>
+              c.idBoard === boardId ||
+              (c.board?.name && c.board.name.toLowerCase().includes(bQuery))
+            );
+          }
+
+          // Map notifications to cards for latest interaction timestamp & unread flag
+          const notifByCard = new Map<string, { latestDate: string; count: number; unread: boolean; latestSnippet?: string; latestAuthor?: string }>();
+          for (const n of notifications) {
+            const cid = n.data.card?.id;
+            if (!cid) continue;
+            const existing = notifByCard.get(cid);
+            if (!existing || new Date(n.date) > new Date(existing.latestDate)) {
+              notifByCard.set(cid, {
+                latestDate: n.date,
+                count: (existing?.count || 0) + 1,
+                unread: existing?.unread || n.unread,
+                latestSnippet: n.data.text,
+                latestAuthor: n.memberCreator?.fullName || n.memberCreator?.username
+              });
+            } else {
+              existing.count++;
+              if (n.unread) existing.unread = true;
+            }
+          }
+
+          // Calculate most recent activity timestamp for each card (max of dateLastActivity & latest notification)
+          const cardsWithActivity = activeCards.map(c => {
+            const notif = notifByCard.get(c.id);
+            const cardModDate = c.dateLastActivity;
+            let latestActivityDate = cardModDate;
+            let activitySource = "card_modified";
+
+            if (notif?.latestDate && (!cardModDate || new Date(notif.latestDate) > new Date(cardModDate))) {
+              latestActivityDate = notif.latestDate;
+              activitySource = "notification_or_comment";
+            }
+
+            return {
+              id: c.id,
+              name: c.name,
+              boardId: c.idBoard,
+              boardName: c.board?.name,
+              listId: c.idList,
+              listName: c.list?.name,
+              due: c.due,
+              dueComplete: c.dueComplete,
+              dateLastActivity: c.dateLastActivity,
+              latestActivityDate,
+              activitySource,
+              hasUnreadNotification: notif?.unread || false,
+              latestNotification: notif ? {
+                date: notif.latestDate,
+                author: notif.latestAuthor,
+                snippet: notif.latestSnippet
+              } : undefined,
+              labels: c.labels,
+              shortUrl: c.shortUrl
+            };
+          });
+
+          // Apply 'since' date filter
+          let sinceDate: Date | null = null;
+          if (since && since !== "all") {
+            const now = Date.now();
+            if (since === "today") {
+              const d = new Date();
+              d.setUTCHours(0, 0, 0, 0);
+              sinceDate = d;
+            } else if (since === "yesterday") {
+              const d = new Date();
+              d.setDate(d.getDate() - 1);
+              d.setUTCHours(0, 0, 0, 0);
+              sinceDate = d;
+            } else if (since === "24h") {
+              sinceDate = new Date(now - 24 * 3600 * 1000);
+            } else if (since === "7d") {
+              sinceDate = new Date(now - 7 * 86400 * 1000);
+            } else if (since === "14d") {
+              sinceDate = new Date(now - 14 * 86400 * 1000);
+            } else if (since === "30d") {
+              sinceDate = new Date(now - 30 * 86400 * 1000);
+            } else {
+              const parsed = new Date(since);
+              if (!isNaN(parsed.getTime())) {
+                sinceDate = parsed;
+              }
+            }
+          }
+
+          let filteredCards = cardsWithActivity;
+          if (sinceDate) {
+            filteredCards = filteredCards.filter(c =>
+              c.latestActivityDate && new Date(c.latestActivityDate) >= sinceDate!
+            );
+          }
+
+          // Sort descending by latestActivityDate
+          filteredCards.sort((a, b) => {
+            const tA = a.latestActivityDate ? new Date(a.latestActivityDate).getTime() : 0;
+            const tB = b.latestActivityDate ? new Date(b.latestActivityDate).getTime() : 0;
+            return tB - tA;
+          });
+
+          const limitedCards = filteredCards.slice(0, limit);
+
+          if (includeComments) {
+            await Promise.all(
+              limitedCards.map(async (card: any) => {
+                try {
+                  const comments = await this.client.getCardComments(card.id, 5);
+                  card.recentComments = comments;
+                } catch {}
+              })
+            );
+          }
+
+          const output = {
+            member: {
+              id: member.id,
+              username: member.username,
+              fullName: member.fullName
+            },
+            sinceFilter: sinceDate ? sinceDate.toISOString() : "all",
+            totalActiveCardsFound: filteredCards.length,
+            cardsReturned: limitedCards.length,
+            cards: limitedCards
+          };
+
+          return { content: [{ type: "text", text: JSON.stringify(output, null, 2) }] };
         } catch (error: any) {
           return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
         }

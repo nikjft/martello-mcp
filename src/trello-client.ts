@@ -125,9 +125,14 @@ export class TrelloClient {
   }
 
   async getBoardLists(boardId: string): Promise<TrelloList[]> {
-    return this.request(`/boards/${encodeURIComponent(boardId)}/lists`, {
-      params: { filter: 'all', fields: 'id,name,idBoard,closed' }
+    const openBoards = await this.getMyBoards();
+    if (!openBoards.some(b => b.id === boardId)) {
+      throw new Error(`Board ${boardId} is closed/archived or does not exist. Only active boards can be queried.`);
+    }
+    const lists = await this.request<TrelloList[]>(`/boards/${encodeURIComponent(boardId)}/lists`, {
+      params: { filter: 'open', fields: 'id,name,idBoard,closed' }
     });
+    return (lists || []).filter(l => !l.closed);
   }
 
   async getCustomFields(boardId: string): Promise<TrelloCustomField[]> {
@@ -141,10 +146,26 @@ export class TrelloClient {
     return res.cards || [];
   }
 
-  async getCard(cardId: string): Promise<TrelloCard> {
-    return this.request(`/cards/${encodeURIComponent(cardId)}`, {
-      params: { customFieldItems: true }
+  async getCard(cardId: string, checkActive: boolean = true): Promise<TrelloCard> {
+    const card = await this.request<TrelloCard>(`/cards/${encodeURIComponent(cardId)}`, {
+      params: { customFieldItems: true, fields: 'all' }
     });
+    if (checkActive && card.closed) {
+      throw new Error(`Card ${cardId} is archived/closed. Only active cards can be queried or modified.`);
+    }
+    return card;
+  }
+
+  /**
+   * Verifies that a card is open AND resides on an active (open) board.
+   */
+  async ensureActiveCard(cardId: string): Promise<TrelloCard> {
+    const card = await this.getCard(cardId, true);
+    const openBoards = await this.getMyBoards();
+    if (!openBoards.some(b => b.id === card.idBoard)) {
+      throw new Error(`Card ${cardId} belongs to a closed/archived board (${card.idBoard}). Only active items can be queried or modified.`);
+    }
+    return card;
   }
 
   async createCard(
@@ -167,6 +188,14 @@ export class TrelloClient {
   }
 
   async updateCard(cardId: string, updates: any): Promise<TrelloCard> {
+    // Explicitly reject any attempt to archive or close a card
+    if (updates && (updates.closed === true || updates.closed === 'true')) {
+      throw new Error("Archiving cards or closing boards is an unsupported operation in this MCP.");
+    }
+    if (updates && 'closed' in updates) {
+      delete updates.closed;
+    }
+    await this.ensureActiveCard(cardId);
     return this.request(`/cards/${encodeURIComponent(cardId)}`, {
       method: 'PUT',
       body: updates
@@ -174,6 +203,7 @@ export class TrelloClient {
   }
 
   async updateCustomField(cardId: string, customFieldId: string, value: any): Promise<void> {
+    await this.ensureActiveCard(cardId);
     await this.request(`/cards/${encodeURIComponent(cardId)}/customField/${encodeURIComponent(customFieldId)}/item`, {
       method: 'PUT',
       body: { value }
@@ -181,12 +211,14 @@ export class TrelloClient {
   }
 
   async getCardChecklists(cardId: string): Promise<TrelloChecklist[]> {
+    await this.ensureActiveCard(cardId);
     return this.request(`/cards/${encodeURIComponent(cardId)}/checklists`, {
       params: { checkItems: 'all', checkItem_fields: 'name,state' }
     });
   }
 
   async createChecklist(cardId: string, name: string): Promise<TrelloChecklist> {
+    await this.ensureActiveCard(cardId);
     return this.request(`/cards/${encodeURIComponent(cardId)}/checklists`, {
       method: 'POST',
       body: { name }
@@ -207,6 +239,7 @@ export class TrelloClient {
   }
 
   async addComment(cardId: string, text: string): Promise<void> {
+    await this.ensureActiveCard(cardId);
     await this.request(`/cards/${encodeURIComponent(cardId)}/actions/comments`, {
       method: 'POST',
       body: { text }
@@ -214,6 +247,7 @@ export class TrelloClient {
   }
 
   async addLabelToCard(cardId: string, labelId: string): Promise<void> {
+    await this.ensureActiveCard(cardId);
     await this.request(`/cards/${encodeURIComponent(cardId)}/idLabels`, {
       method: 'POST',
       body: { value: labelId }
@@ -221,16 +255,25 @@ export class TrelloClient {
   }
 
   async removeLabelFromCard(cardId: string, labelId: string): Promise<void> {
+    await this.ensureActiveCard(cardId);
     await this.request(`/cards/${encodeURIComponent(cardId)}/idLabels/${encodeURIComponent(labelId)}`, {
       method: 'DELETE'
     });
   }
 
   async getBoardLabels(boardId: string): Promise<any[]> {
+    const openBoards = await this.getMyBoards();
+    if (!openBoards.some(b => b.id === boardId)) {
+      throw new Error(`Board ${boardId} is closed/archived or does not exist. Only active boards can be queried.`);
+    }
     return this.request(`/boards/${encodeURIComponent(boardId)}/labels`);
   }
 
   async createLabel(boardId: string, name: string, color: string): Promise<any> {
+    const openBoards = await this.getMyBoards();
+    if (!openBoards.some(b => b.id === boardId)) {
+      throw new Error(`Board ${boardId} is closed/archived. Cannot create label on a closed board.`);
+    }
     return this.request(`/boards/${encodeURIComponent(boardId)}/labels`, {
       method: 'POST',
       body: { name, color }
@@ -273,7 +316,28 @@ export class TrelloClient {
   }
 
   async getList(listId: string): Promise<TrelloList> {
-    return this.request(`/lists/${encodeURIComponent(listId)}`);
+    const list = await this.request<TrelloList>(`/lists/${encodeURIComponent(listId)}`);
+    if (list.closed) {
+      throw new Error(`List ${listId} is archived/closed. Only active lists can be accessed.`);
+    }
+    return list;
+  }
+
+  async getMember(memberIdOrUsername: string = 'me'): Promise<TrelloMember> {
+    return this.request(`/members/${encodeURIComponent(memberIdOrUsername)}`, {
+      params: { fields: 'id,username,fullName' }
+    });
+  }
+
+  async getMemberCards(memberIdOrUsername: string = 'me'): Promise<any[]> {
+    return this.request(`/members/${encodeURIComponent(memberIdOrUsername)}/cards`, {
+      params: {
+        filter: 'open',
+        fields: 'id,name,desc,due,dueComplete,dateLastActivity,idBoard,idList,shortUrl,labels,idMembers,closed',
+        list: 'true',
+        board: 'true'
+      }
+    });
   }
 
   async getCardDetail(cardId: string): Promise<CardDetail> {
