@@ -1,4 +1,3 @@
-import axios, { AxiosInstance } from 'axios';
 import {
   TrelloBoard,
   TrelloCard,
@@ -10,19 +9,16 @@ import {
 
 const DELAY_MS = 120;
 const MAX_RETRIES = 4;
+const BASE_URL = 'https://api.trello.com/1';
 
 export class TrelloClient {
-  private axiosInstance: AxiosInstance;
+  private apiKey: string;
+  private token: string;
   private lastRequestTime: number = 0;
 
   constructor(config: TrelloConfig) {
-    this.axiosInstance = axios.create({
-      baseURL: 'https://api.trello.com/1',
-      params: {
-        key: config.apiKey,
-        token: config.token,
-      },
-    });
+    this.apiKey = config.apiKey;
+    this.token = config.token;
   }
 
   private async rateLimitDelay() {
@@ -34,159 +30,202 @@ export class TrelloClient {
     this.lastRequestTime = Date.now();
   }
 
-  private async handleRequest<T>(requestFn: () => Promise<T>, attempt: number = 1): Promise<T> {
+  private async request<T>(
+    endpoint: string,
+    options: {
+      method?: string;
+      params?: Record<string, any>;
+      body?: any;
+    } = {},
+    attempt: number = 1
+  ): Promise<T> {
     await this.rateLimitDelay();
+
+    const method = options.method || 'GET';
+    const url = new URL(`${BASE_URL}${endpoint}`);
+    url.searchParams.set('key', this.apiKey);
+    url.searchParams.set('token', this.token);
+
+    if (options.params) {
+      for (const [key, value] of Object.entries(options.params)) {
+        if (value !== undefined && value !== null) {
+          url.searchParams.set(key, String(value));
+        }
+      }
+    }
+
+    const headers: Record<string, string> = {
+      'Accept': 'application/json'
+    };
+
+    let body: string | undefined;
+    if (options.body !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      body = JSON.stringify(options.body);
+    }
+
     try {
-      return await requestFn();
-    } catch (error: any) {
-      if (error.response?.status === 429 && attempt <= MAX_RETRIES) {
-        const backoff = 10000 * attempt; // 10s * attempt, same as python logic
+      const response = await fetch(url.toString(), {
+        method,
+        headers,
+        body
+      });
+
+      if (response.status === 429 && attempt <= MAX_RETRIES) {
+        const backoff = 10000 * attempt;
         console.warn(`Trello rate-limited. Waiting ${backoff}ms...`);
         await new Promise(resolve => setTimeout(resolve, backoff));
-        return this.handleRequest(requestFn, attempt + 1);
+        return this.request<T>(endpoint, options, attempt + 1);
       }
-      throw new Error(`Trello API Error: ${error.response?.status} - ${JSON.stringify(error.response?.data) || error.message}`);
+
+      if (!response.ok) {
+        let errBody: string;
+        try {
+          errBody = await response.text();
+        } catch {
+          errBody = response.statusText;
+        }
+        throw new Error(`Trello API Error: ${response.status} - ${errBody}`);
+      }
+
+      const text = await response.text();
+      if (!text) {
+        return {} as T;
+      }
+      return JSON.parse(text) as T;
+    } catch (error: any) {
+      if (error.message?.startsWith('Trello API Error:')) {
+        throw error;
+      }
+      if (attempt <= MAX_RETRIES) {
+        const backoff = 1000 * attempt;
+        await new Promise(resolve => setTimeout(resolve, backoff));
+        return this.request<T>(endpoint, options, attempt + 1);
+      }
+      throw new Error(`Trello Request Failed: ${error.message}`);
     }
   }
 
   async getBoardMembers(boardId: string): Promise<any[]> {
-    return this.handleRequest(async () => {
-      const res = await this.axiosInstance.get(`/boards/${boardId}/members`);
-      return res.data;
-    });
+    return this.request(`/boards/${encodeURIComponent(boardId)}/members`);
   }
 
   async getMyBoards(): Promise<TrelloBoard[]> {
-    return this.handleRequest(async () => {
-      const res = await this.axiosInstance.get('/members/me/boards', {
-        params: { filter: 'open', fields: 'id,name,closed,url' }
-      });
-      return res.data;
+    return this.request('/members/me/boards', {
+      params: { filter: 'open', fields: 'id,name,closed,url' }
     });
   }
 
   async getBoardLists(boardId: string): Promise<TrelloList[]> {
-    return this.handleRequest(async () => {
-      const res = await this.axiosInstance.get(`/boards/${boardId}/lists`, {
-        params: { filter: 'all', fields: 'id,name,idBoard,closed' }
-      });
-      return res.data;
+    return this.request(`/boards/${encodeURIComponent(boardId)}/lists`, {
+      params: { filter: 'all', fields: 'id,name,idBoard,closed' }
     });
   }
 
   async getCustomFields(boardId: string): Promise<TrelloCustomField[]> {
-    return this.handleRequest(async () => {
-      const res = await this.axiosInstance.get(`/boards/${boardId}/customFields`);
-      return res.data;
-    });
+    return this.request(`/boards/${encodeURIComponent(boardId)}/customFields`);
   }
 
   async searchCards(query: string): Promise<TrelloCard[]> {
-    return this.handleRequest(async () => {
-      const res = await this.axiosInstance.get('/search', {
-        params: { query, modelTypes: 'cards', cards_limit: 1000 }
-      });
-      return res.data.cards;
+    const res = await this.request<{ cards: TrelloCard[] }>('/search', {
+      params: { query, modelTypes: 'cards', cards_limit: 1000 }
     });
+    return res.cards || [];
   }
 
   async getCard(cardId: string): Promise<TrelloCard> {
-    return this.handleRequest(async () => {
-      const res = await this.axiosInstance.get(`/cards/${cardId}`, {
-        params: { customFieldItems: true }
-      });
-      return res.data;
+    return this.request(`/cards/${encodeURIComponent(cardId)}`, {
+      params: { customFieldItems: true }
     });
   }
 
-  async createCard(listId: string, name: string, desc?: string, dueDate?: string, startDate?: string): Promise<TrelloCard> {
-    return this.handleRequest(async () => {
-      const res = await this.axiosInstance.post('/cards', {
+  async createCard(
+    listId: string,
+    name: string,
+    desc?: string,
+    dueDate?: string,
+    startDate?: string
+  ): Promise<TrelloCard> {
+    return this.request('/cards', {
+      method: 'POST',
+      body: {
         idList: listId,
         name,
         desc,
         due: dueDate,
         start: startDate
-      });
-      return res.data;
+      }
     });
   }
 
   async updateCard(cardId: string, updates: any): Promise<TrelloCard> {
-    return this.handleRequest(async () => {
-      const res = await this.axiosInstance.put(`/cards/${cardId}`, updates);
-      return res.data;
+    return this.request(`/cards/${encodeURIComponent(cardId)}`, {
+      method: 'PUT',
+      body: updates
     });
   }
 
   async updateCustomField(cardId: string, customFieldId: string, value: any): Promise<void> {
-    return this.handleRequest(async () => {
-      await this.axiosInstance.put(`/cards/${cardId}/customField/${customFieldId}/item`, {
-        value
-      });
+    await this.request(`/cards/${encodeURIComponent(cardId)}/customField/${encodeURIComponent(customFieldId)}/item`, {
+      method: 'PUT',
+      body: { value }
     });
   }
 
   async getCardChecklists(cardId: string): Promise<TrelloChecklist[]> {
-    return this.handleRequest(async () => {
-      const res = await this.axiosInstance.get(`/cards/${cardId}/checklists`, {
-        params: { checkItems: 'all', checkItem_fields: 'name,state' }
-      });
-      return res.data;
+    return this.request(`/cards/${encodeURIComponent(cardId)}/checklists`, {
+      params: { checkItems: 'all', checkItem_fields: 'name,state' }
     });
   }
 
   async createChecklist(cardId: string, name: string): Promise<TrelloChecklist> {
-    return this.handleRequest(async () => {
-      const res = await this.axiosInstance.post(`/cards/${cardId}/checklists`, { name });
-      return res.data;
+    return this.request(`/cards/${encodeURIComponent(cardId)}/checklists`, {
+      method: 'POST',
+      body: { name }
     });
   }
 
   async addChecklistItem(checklistId: string, name: string): Promise<void> {
-    return this.handleRequest(async () => {
-      await this.axiosInstance.post(`/checklists/${checklistId}/checkItems`, { name });
+    await this.request(`/checklists/${encodeURIComponent(checklistId)}/checkItems`, {
+      method: 'POST',
+      body: { name }
     });
   }
 
   async removeChecklistItem(checklistId: string, idCheckItem: string): Promise<void> {
-    return this.handleRequest(async () => {
-      await this.axiosInstance.delete(`/checklists/${checklistId}/checkItems/${idCheckItem}`);
+    await this.request(`/checklists/${encodeURIComponent(checklistId)}/checkItems/${encodeURIComponent(idCheckItem)}`, {
+      method: 'DELETE'
     });
   }
 
   async addComment(cardId: string, text: string): Promise<void> {
-    return this.handleRequest(async () => {
-      await this.axiosInstance.post(`/cards/${cardId}/actions/comments`, { text });
+    await this.request(`/cards/${encodeURIComponent(cardId)}/actions/comments`, {
+      method: 'POST',
+      body: { text }
     });
   }
 
   async addLabelToCard(cardId: string, labelId: string): Promise<void> {
-    return this.handleRequest(async () => {
-      await this.axiosInstance.post(`/cards/${cardId}/idLabels`, { value: labelId });
+    await this.request(`/cards/${encodeURIComponent(cardId)}/idLabels`, {
+      method: 'POST',
+      body: { value: labelId }
     });
   }
-  
+
   async removeLabelFromCard(cardId: string, labelId: string): Promise<void> {
-    return this.handleRequest(async () => {
-      await this.axiosInstance.delete(`/cards/${cardId}/idLabels/${labelId}`);
+    await this.request(`/cards/${encodeURIComponent(cardId)}/idLabels/${encodeURIComponent(labelId)}`, {
+      method: 'DELETE'
     });
   }
 
   async getBoardLabels(boardId: string): Promise<any[]> {
-    return this.handleRequest(async () => {
-      const res = await this.axiosInstance.get(`/boards/${boardId}/labels`);
-      return res.data;
-    });
+    return this.request(`/boards/${encodeURIComponent(boardId)}/labels`);
   }
 
   async createLabel(boardId: string, name: string, color: string): Promise<any> {
-    return this.handleRequest(async () => {
-      const res = await this.axiosInstance.post(`/boards/${boardId}/labels`, {
-        name,
-        color
-      });
-      return res.data;
+    return this.request(`/boards/${encodeURIComponent(boardId)}/labels`, {
+      method: 'POST',
+      body: { name, color }
     });
   }
 }

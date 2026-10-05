@@ -5,3 +5,6 @@ dist/
 *.log
 Examples and Context/
 .env.local
+.wrangler/
+.dev.vars
+

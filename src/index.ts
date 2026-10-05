@@ -1,476 +1,475 @@
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { TrelloClient } from './trello-client.js';
-import { McGawSemantics } from './semantics.js';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
+import { McpAgent } from "agents/mcp";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
 
-// Manually load .env.local to avoid dotenvx noise on stdout
-try {
-  const envPath = path.resolve(process.cwd(), '.env.local');
-  if (fs.existsSync(envPath)) {
-    const envConfig = fs.readFileSync(envPath, 'utf-8');
-    envConfig.split('\n').forEach((line: string) => {
-      const [key, ...valueParts] = line.split('=');
-      if (key && valueParts.length > 0) {
-        process.env[key.trim()] = valueParts.join('=').trim();
-      }
-    });
+import { TrelloClient } from "./trello-client.js";
+import { McGawSemantics } from "./semantics.js";
+
+export class MartelloMCP extends McpAgent {
+  server = new McpServer({
+    name: "mcgaw-trello-mcp",
+    version: "1.0.0",
+    description: "Martello MCP: McGaw Trello Project Management server running on Cloudflare Workers"
+  });
+
+  private client!: TrelloClient;
+  private semantics!: McGawSemantics;
+  private workerEnv!: Env;
+
+  constructor(state: DurableObjectState, env: Env) {
+    super(state, env);
+    this.workerEnv = env;
   }
-} catch (e) {
-  // Ignore
-}
 
-const API_KEY = process.env.TRELLO_API_KEY;
-const TOKEN = process.env.TRELLO_TOKEN;
+  async init() {
+    if (this.workerEnv?.TRELLO_API_KEY && this.workerEnv?.TRELLO_TOKEN) {
+      this.client = new TrelloClient({
+        apiKey: this.workerEnv.TRELLO_API_KEY,
+        token: this.workerEnv.TRELLO_TOKEN,
+      });
+      this.semantics = new McGawSemantics(this.client);
+    }
 
-if (!API_KEY || !TOKEN) {
-  console.error("TRELLO_API_KEY and TRELLO_TOKEN environment variables must be set.");
-  process.exit(1);
-}
-
-const client = new TrelloClient({ apiKey: API_KEY, token: TOKEN });
-const semantics = new McGawSemantics(client);
-
-const server = new Server({
-  name: "mcgaw-trello-mcp",
-  version: "1.0.0"
-}, {
-  capabilities: {
-    tools: {}
-  }
-});
-
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      {
-        name: "search_cards",
-        description: "Search for cards across boards using Trello's advanced search syntax. Automatically filters out cards in 'Completed*' lists unless 'is:archived' or similar is explicitly requested.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            query: { type: "string", description: "Trello search query (e.g., 'board:\"Board Name\" list:\"Next Week\"')." },
-            excludeCompletedLists: { type: "boolean", description: "Whether to manually exclude cards residing in lists that contain 'completed' in their name.", default: true }
-          },
-          required: ["query"]
-        }
-      },
-      {
-        name: "query_boards",
-        description: "List all open boards or search by name.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            nameFilter: { type: "string", description: "Optional substring to filter board names." }
-          }
-        }
-      },
-      {
-        name: "get_board_lists",
-        description: "Get all lists on a specific Trello board.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            boardId: { type: "string", description: "The Trello board ID." }
-          },
-          required: ["boardId"]
-        }
-      },
-      {
-        name: "query_epic_lineage",
-        description: "Get the full tree/lineage of an Epic or Sub-Epic by following the 'children' checklists recursively.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            epicCardUrlOrId: { type: "string", description: "The Trello card short URL or ID." }
-          },
-          required: ["epicCardUrlOrId"]
-        }
-      },
-      {
-        name: "create_card",
-        description: "Create a new task card. Enforces estimate formatting if provided. Automatically cascades Epic labels if parentUrl is provided.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            listId: { type: "string", description: "The ID of the list to create the card in." },
-            title: { type: "string", description: "Action-oriented title." },
-            estimate: { type: "number", description: "Estimated hours (optional). Will be prepended as (Est)." },
-            description: { type: "string", description: "Description containing Goal, Scope, and Result." },
-            clientPrefix: { type: "string", description: "Client prefix string for shared boards (e.g., 'Crunch Fitness: ')." },
-            parentUrl: { type: "string", description: "URL of the parent Epic or Sub-Epic to link to." },
-            idMembers: { type: "array", items: { type: "string" } },
-            idLabels: { type: "array", items: { type: "string" } },
-            startDate: { type: "string", description: "ISO date string for start date (Epics and Sub-Epics only)." },
-            dueDate: { type: "string", description: "ISO date string for due date." }
-          },
-          required: ["listId", "title"]
-        }
-      },
-      {
-        name: "update_card_details",
-        description: "Update the title, description, or schedule (due and start dates) of a card.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            cardId: { type: "string", description: "Trello card ID, Short Link, or URL." },
-            title: { type: "string" },
-            description: { type: "string" },
-            dueDate: { type: "string", description: "ISO date string to schedule the card (Trello due date)." },
-            startDate: { type: "string", description: "ISO date string for start date (Epics and Sub-Epics only)." },
-            idMembers: { type: "array", items: { type: "string" } },
-            idLabels: { type: "array", items: { type: "string" } },
-            userNow: { type: "string", description: "User's current ISO date string (for weekly list movement logic)." }
-          },
-          required: ["cardId"]
-        }
-      },
-      {
-        name: "update_estimate",
-        description: "Safely update the (Est) portion of a card title without touching the [Spent] portion.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            cardId: { type: "string", description: "Trello card ID, Short Link, or URL." },
-            newEstimate: { type: "number", description: "New estimated hours." }
-          },
-          required: ["cardId", "newEstimate"]
-        }
-      },
-      {
-        name: "update_get_it_done_date",
-        description: "Update the 'Get it done Date' custom field. Looks up the field dynamically by name for the board.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            cardId: { type: "string", description: "Trello card ID, Short Link, or URL." },
-            dateStr: { type: "string", description: "ISO date string." }
-          },
-          required: ["cardId", "dateStr"]
-        }
-      },
-      {
-        name: "move_card",
-        description: "Move a card to a different list.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            cardId: { type: "string" },
-            listId: { type: "string" }
-          },
-          required: ["cardId", "listId"]
-        }
-      },
-      {
-        name: "complete_card",
-        description: "Semantically complete a card: Marks due date complete, and moves it to a 'Review' list.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            cardId: { type: "string", description: "Trello card ID, Short Link, or URL." },
-            reviewListId: { type: "string", description: "ID of the Review list to move the card to." }
-          },
-          required: ["cardId", "reviewListId"]
-        }
-      },
-      {
-        name: "update_relationship",
-        description: "Establish or remove a bidirectional relationship between two cards.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            sourceCardId: { type: "string", description: "Trello card ID, Short Link, or URL." },
-            targetCardId: { type: "string", description: "Trello card ID, Short Link, or URL." },
-            relationshipType: { type: "string", enum: ["parent-child", "blocker-blocked", "related"] },
-            action: { type: "string", enum: ["link", "unlink"] }
-          },
-          required: ["sourceCardId", "targetCardId", "relationshipType", "action"]
-        }
-      },
-      {
-        name: "add_comment",
-        description: "Add a comment to a card. Can include @mentions.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            cardId: { type: "string", description: "Trello card ID, Short Link, or URL." },
-            text: { type: "string" }
-          },
-          required: ["cardId", "text"]
-        }
-      },
-      {
-        name: "search_members",
-        description: "Search for members on a board by name or username to get their Trello IDs.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            boardId: { type: "string" },
-            query: { type: "string", description: "Name or username to search for." }
-          },
-          required: ["boardId", "query"]
-        }
-      },
-      {
-        name: "create_label",
-        description: "Create a new label on a board.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            boardId: { type: "string" },
-            name: { type: "string" },
-            color: { type: "string", enum: ["yellow", "purple", "blue", "red", "green", "orange", "black", "sky", "pink", "lime"] }
-          },
-          required: ["boardId", "name", "color"]
-        }
-      },
-      {
-        name: "add_label_to_card",
-        description: "Add an existing label to a card.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            cardId: { type: "string", description: "Trello card ID, Short Link, or URL." },
-            labelId: { type: "string", description: "The ID of the label to add." }
-          },
-          required: ["cardId", "labelId"]
-        }
-      },
-      {
-        name: "remove_label_from_card",
-        description: "Remove a label from a card.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            cardId: { type: "string", description: "Trello card ID, Short Link, or URL." },
-            labelId: { type: "string", description: "The ID of the label to remove." }
-          },
-          required: ["cardId", "labelId"]
-        }
+    const checkInit = () => {
+      if (!this.client || !this.semantics) {
+        throw new Error(
+          "Trello client not initialized. Please ensure TRELLO_API_KEY and TRELLO_TOKEN secrets are configured."
+        );
       }
-    ]
-  };
-});
+    };
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-  try {
-    switch (name) {
-      case "search_cards": {
-        const { query, excludeCompletedLists = true } = args as any;
-        const rawCards = await client.searchCards(query);
-        let finalCards = rawCards;
+    // 1. search_cards
+    this.server.tool(
+      "search_cards",
+      {
+        query: z.string().describe("Trello search query (e.g., 'board:\"Board Name\" list:\"Next Week\"')."),
+        excludeCompletedLists: z.boolean().optional().default(true).describe("Whether to manually exclude cards residing in lists that contain 'completed' in their name.")
+      },
+      async ({ query, excludeCompletedLists }) => {
+        try {
+          checkInit();
+          const rawCards = await this.client.searchCards(query);
+          let finalCards = rawCards;
 
-        if (excludeCompletedLists) {
-          // Resolve list names to filter out "completed" lists
-          // To do this efficiently, we gather unique board IDs and fetch their lists
-          const boardIds = [...new Set(rawCards.map(c => c.idBoard))];
-          const listsMap = new Map<string, string>(); // listId -> listName
-          for (const bid of boardIds) {
-            const lists = await client.getBoardLists(bid);
-            for (const l of lists) {
-              listsMap.set(l.id, l.name.toLowerCase());
+          if (excludeCompletedLists) {
+            const boardIds = [...new Set(rawCards.map(c => c.idBoard))];
+            const listsMap = new Map<string, string>();
+            for (const bid of boardIds) {
+              const lists = await this.client.getBoardLists(bid);
+              for (const l of lists) {
+                listsMap.set(l.id, l.name.toLowerCase());
+              }
             }
+            finalCards = rawCards.filter(c => {
+              const lname = listsMap.get(c.idList);
+              if (!lname) return true;
+              return !lname.includes("completed") && !lname.includes("template");
+            });
           }
-          finalCards = rawCards.filter(c => {
-            const lname = listsMap.get(c.idList);
-            if (!lname) return true;
-            const matchesCompleted = lname.includes("completed") || lname.includes("template");
-            // Also check for ungroomed cards if they are in these lists? 
-            // Actually, usually we exclude completed lists entirely.
-            return !matchesCompleted;
-          });
+
+          const cardsWithMetadata = finalCards.map(c => ({
+            ...c,
+            isGroomed: this.semantics.isGroomed(c.name)
+          }));
+
+          return { content: [{ type: "text", text: JSON.stringify(cardsWithMetadata, null, 2) }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
         }
-        
-        // Add groomed flag to results
-        const cardsWithMetadata = finalCards.map(c => ({
-          ...c,
-          isGroomed: semantics.isGroomed(c.name)
-        }));
-        
-        return { content: [{ type: "text", text: JSON.stringify(cardsWithMetadata, null, 2) }] };
       }
+    );
 
-      case "query_boards": {
-        const { nameFilter } = args as any;
-        const boards = await client.getMyBoards();
-        const filtered = nameFilter ? boards.filter(b => b.name.toLowerCase().includes(nameFilter.toLowerCase())) : boards;
-        return { content: [{ type: "text", text: JSON.stringify(filtered, null, 2) }] };
-      }
-
-      case "get_board_lists": {
-        const { boardId } = args as any;
-        const lists = await client.getBoardLists(boardId);
-        return { content: [{ type: "text", text: JSON.stringify(lists, null, 2) }] };
-      }
-
-      case "query_epic_lineage": {
-        const { epicCardUrlOrId } = args as any;
-        const lineage = await semantics.getEpicLineage(epicCardUrlOrId);
-        return { content: [{ type: "text", text: JSON.stringify(lineage, null, 2) }] };
-      }
-
-      case "create_card": {
-        const { listId, title, estimate, description, clientPrefix, parentUrl, idMembers, idLabels, startDate, dueDate } = args as any;
-        let finalTitle = title;
-        if (clientPrefix) finalTitle = `${clientPrefix} ${finalTitle}`;
-        if (estimate !== undefined) finalTitle = `(${estimate}) ${finalTitle}`;
-
-        // Enforcement: startDate only for Epics/Sub-Epics
-        if (startDate && !semantics.isEpicOrSubEpic(finalTitle)) {
-          throw new Error("Start dates can only be set on Epics or Sub-Epics. Tasks should only have a due date.");
+    // 2. query_boards
+    this.server.tool(
+      "query_boards",
+      {
+        nameFilter: z.string().optional().describe("Optional substring to filter board names.")
+      },
+      async ({ nameFilter }) => {
+        try {
+          checkInit();
+          const boards = await this.client.getMyBoards();
+          const filtered = nameFilter
+            ? boards.filter(b => b.name.toLowerCase().includes(nameFilter.toLowerCase()))
+            : boards;
+          return { content: [{ type: "text", text: JSON.stringify(filtered, null, 2) }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
         }
-
-        const card = await client.createCard(listId, finalTitle, description, dueDate, startDate);
-        if (idMembers || idLabels) {
-          const updates: any = {};
-          if (idMembers) updates.idMembers = idMembers.join(',');
-          if (idLabels) updates.idLabels = idLabels.join(',');
-          await client.updateCard(card.id, updates);
-        }
-
-        if (parentUrl) {
-          const parentMatch = /https:\/\/trello\.com\/c\/([A-Za-z0-9]+)/i.exec(parentUrl);
-          const parentId = parentMatch ? parentMatch[1] : parentUrl;
-          const parentCard = await client.getCard(parentId);
-          await semantics.updateRelationship(parentCard, card, "parent-child", "link");
-        }
-
-        return { content: [{ type: "text", text: JSON.stringify(card, null, 2) }] };
       }
+    );
 
-      case "update_card_details": {
-        const { cardId: rawId, title, description, dueDate, startDate, idMembers, idLabels, userNow } = args as any;
-        const cardId = semantics.extractCardId(rawId);
-        const updates: any = {};
-        if (title) updates.name = title;
-        if (description) updates.desc = description;
-        if (dueDate) updates.due = dueDate;
-        if (startDate) updates.start = startDate;
-        if (idMembers) updates.idMembers = idMembers.join(',');
-        if (idLabels) updates.idLabels = idLabels.join(',');
+    // 3. get_board_lists
+    this.server.tool(
+      "get_board_lists",
+      {
+        boardId: z.string().describe("The Trello board ID.")
+      },
+      async ({ boardId }) => {
+        try {
+          checkInit();
+          const lists = await this.client.getBoardLists(boardId);
+          return { content: [{ type: "text", text: JSON.stringify(lists, null, 2) }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
+      }
+    );
 
-        // Enforcement: startDate only for Epics/Sub-Epics
-        if (startDate) {
-          // If title is changing, check the new title. Otherwise, fetch the card to check existing title.
-          const checkTitle = title || (await client.getCard(cardId)).name;
-          if (!semantics.isEpicOrSubEpic(checkTitle)) {
+    // 4. query_epic_lineage
+    this.server.tool(
+      "query_epic_lineage",
+      {
+        epicCardUrlOrId: z.string().describe("The Trello card short URL or ID.")
+      },
+      async ({ epicCardUrlOrId }) => {
+        try {
+          checkInit();
+          const lineage = await this.semantics.getEpicLineage(epicCardUrlOrId);
+          return { content: [{ type: "text", text: JSON.stringify(lineage, null, 2) }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
+      }
+    );
+
+    // 5. create_card
+    this.server.tool(
+      "create_card",
+      {
+        listId: z.string().describe("The ID of the list to create the card in."),
+        title: z.string().describe("Action-oriented title."),
+        estimate: z.number().optional().describe("Estimated hours (optional). Will be prepended as (Est)."),
+        description: z.string().optional().describe("Description containing Goal, Scope, and Result."),
+        clientPrefix: z.string().optional().describe("Client prefix string for shared boards (e.g., 'Crunch Fitness: ')."),
+        parentUrl: z.string().optional().describe("URL of the parent Epic or Sub-Epic to link to."),
+        idMembers: z.array(z.string()).optional(),
+        idLabels: z.array(z.string()).optional(),
+        startDate: z.string().optional().describe("ISO date string for start date (Epics and Sub-Epics only)."),
+        dueDate: z.string().optional().describe("ISO date string for due date.")
+      },
+      async ({
+        listId,
+        title,
+        estimate,
+        description,
+        clientPrefix,
+        parentUrl,
+        idMembers,
+        idLabels,
+        startDate,
+        dueDate
+      }) => {
+        try {
+          checkInit();
+          let finalTitle = title;
+          if (clientPrefix) finalTitle = `${clientPrefix} ${finalTitle}`;
+          if (estimate !== undefined) finalTitle = `(${estimate}) ${finalTitle}`;
+
+          if (startDate && !this.semantics.isEpicOrSubEpic(finalTitle)) {
             throw new Error("Start dates can only be set on Epics or Sub-Epics. Tasks should only have a due date.");
           }
-        }
-        
-        // If due date changed, calculate target list
-        if (dueDate && userNow) {
-          const card = await client.getCard(cardId);
-          const targetListId = await semantics.getTargetListForDate(card.idBoard, new Date(dueDate), new Date(userNow));
-          if (targetListId) {
-            updates.idList = targetListId;
+
+          const card = await this.client.createCard(listId, finalTitle, description, dueDate, startDate);
+          if (idMembers || idLabels) {
+            const updates: any = {};
+            if (idMembers) updates.idMembers = idMembers.join(",");
+            if (idLabels) updates.idLabels = idLabels.join(",");
+            await this.client.updateCard(card.id, updates);
           }
+
+          if (parentUrl) {
+            const parentMatch = /https:\/\/trello\.com\/c\/([A-Za-z0-9]+)/i.exec(parentUrl);
+            const parentId = parentMatch ? parentMatch[1] : parentUrl;
+            const parentCard = await this.client.getCard(parentId);
+            await this.semantics.updateRelationship(parentCard, card, "parent-child", "link");
+          }
+
+          return { content: [{ type: "text", text: JSON.stringify(card, null, 2) }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
         }
-        
-        const updated = await client.updateCard(cardId, updates);
-        return { content: [{ type: "text", text: JSON.stringify(updated, null, 2) }] };
       }
+    );
 
-      case "update_estimate": {
-        const { cardId: rawId, newEstimate } = args as any;
-        const cardId = semantics.extractCardId(rawId);
-        const card = await client.getCard(cardId);
-        const newTitle = semantics.updateEstimate(card.name, newEstimate);
-        const updated = await client.updateCard(card.id, { name: newTitle });
-        return { content: [{ type: "text", text: JSON.stringify(updated, null, 2) }] };
-      }
+    // 6. update_card_details
+    this.server.tool(
+      "update_card_details",
+      {
+        cardId: z.string().describe("Trello card ID, Short Link, or URL."),
+        title: z.string().optional(),
+        description: z.string().optional(),
+        dueDate: z.string().optional().describe("ISO date string to schedule the card (Trello due date)."),
+        startDate: z.string().optional().describe("ISO date string for start date (Epics and Sub-Epics only)."),
+        idMembers: z.array(z.string()).optional(),
+        idLabels: z.array(z.string()).optional(),
+        userNow: z.string().optional().describe("User's current ISO date string (for weekly list movement logic).")
+      },
+      async ({ cardId: rawId, title, description, dueDate, startDate, idMembers, idLabels, userNow }) => {
+        try {
+          checkInit();
+          const cardId = this.semantics.extractCardId(rawId);
+          const updates: any = {};
+          if (title) updates.name = title;
+          if (description) updates.desc = description;
+          if (dueDate) updates.due = dueDate;
+          if (startDate) updates.start = startDate;
+          if (idMembers) updates.idMembers = idMembers.join(",");
+          if (idLabels) updates.idLabels = idLabels.join(",");
 
-      case "update_get_it_done_date": {
-        const { cardId: rawId, dateStr } = args as any;
-        const cardId = semantics.extractCardId(rawId);
-        const card = await client.getCard(cardId);
-        const customFieldId = await semantics.getItDoneDateFieldId(card.idBoard);
-        if (!customFieldId) {
-          throw new Error("Could not find 'Get it done Date' custom field on this board.");
+          if (startDate) {
+            const checkTitle = title || (await this.client.getCard(cardId)).name;
+            if (!this.semantics.isEpicOrSubEpic(checkTitle)) {
+              throw new Error("Start dates can only be set on Epics or Sub-Epics. Tasks should only have a due date.");
+            }
+          }
+
+          if (dueDate && userNow) {
+            const card = await this.client.getCard(cardId);
+            const targetListId = await this.semantics.getTargetListForDate(
+              card.idBoard,
+              new Date(dueDate),
+              new Date(userNow)
+            );
+            if (targetListId) {
+              updates.idList = targetListId;
+            }
+          }
+
+          const updated = await this.client.updateCard(cardId, updates);
+          return { content: [{ type: "text", text: JSON.stringify(updated, null, 2) }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
         }
-        await client.updateCustomField(cardId, customFieldId, { date: dateStr });
-        return { content: [{ type: "text", text: "Successfully updated custom field." }] };
       }
+    );
 
-      case "move_card": {
-        const { cardId: rawId, listId } = args as any;
-        const cardId = semantics.extractCardId(rawId);
-        const updated = await client.updateCard(cardId, { idList: listId });
-        return { content: [{ type: "text", text: JSON.stringify(updated, null, 2) }] };
+    // 7. update_estimate
+    this.server.tool(
+      "update_estimate",
+      {
+        cardId: z.string().describe("Trello card ID, Short Link, or URL."),
+        newEstimate: z.number().describe("New estimated hours.")
+      },
+      async ({ cardId: rawId, newEstimate }) => {
+        try {
+          checkInit();
+          const cardId = this.semantics.extractCardId(rawId);
+          const card = await this.client.getCard(cardId);
+          const newTitle = this.semantics.updateEstimate(card.name, newEstimate);
+          const updated = await this.client.updateCard(card.id, { name: newTitle });
+          return { content: [{ type: "text", text: JSON.stringify(updated, null, 2) }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
       }
+    );
 
-      case "complete_card": {
-        const { cardId: rawId, reviewListId } = args as any;
-        const cardId = semantics.extractCardId(rawId);
-        const updated = await client.updateCard(cardId, { idList: reviewListId, dueComplete: true });
-        return { content: [{ type: "text", text: JSON.stringify(updated, null, 2) }] };
+    // 8. update_get_it_done_date
+    this.server.tool(
+      "update_get_it_done_date",
+      {
+        cardId: z.string().describe("Trello card ID, Short Link, or URL."),
+        dateStr: z.string().describe("ISO date string.")
+      },
+      async ({ cardId: rawId, dateStr }) => {
+        try {
+          checkInit();
+          const cardId = this.semantics.extractCardId(rawId);
+          const card = await this.client.getCard(cardId);
+          const customFieldId = await this.semantics.getItDoneDateFieldId(card.idBoard);
+          if (!customFieldId) {
+            throw new Error("Could not find 'Get it done Date' custom field on this board.");
+          }
+          await this.client.updateCustomField(cardId, customFieldId, { date: dateStr });
+          return { content: [{ type: "text", text: "Successfully updated custom field." }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
       }
+    );
 
-      case "update_relationship": {
-        const { sourceCardId: rawSource, targetCardId: rawTarget, relationshipType, action } = args as any;
-        const sourceId = semantics.extractCardId(rawSource);
-        const targetId = semantics.extractCardId(rawTarget);
-        const sourceCard = await client.getCard(sourceId);
-        const targetCard = await client.getCard(targetId);
-        await semantics.updateRelationship(sourceCard, targetCard, relationshipType as any, action as any);
-        return { content: [{ type: "text", text: "Successfully updated relationship." }] };
+    // 9. move_card
+    this.server.tool(
+      "move_card",
+      {
+        cardId: z.string(),
+        listId: z.string()
+      },
+      async ({ cardId: rawId, listId }) => {
+        try {
+          checkInit();
+          const cardId = this.semantics.extractCardId(rawId);
+          const updated = await this.client.updateCard(cardId, { idList: listId });
+          return { content: [{ type: "text", text: JSON.stringify(updated, null, 2) }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
       }
+    );
 
-      case "add_comment": {
-        const { cardId: rawId, text } = args as any;
-        const cardId = semantics.extractCardId(rawId);
-        await client.addComment(cardId, text);
-        return { content: [{ type: "text", text: "Comment added." }] };
+    // 10. complete_card
+    this.server.tool(
+      "complete_card",
+      {
+        cardId: z.string().describe("Trello card ID, Short Link, or URL."),
+        reviewListId: z.string().describe("ID of the Review list to move the card to.")
+      },
+      async ({ cardId: rawId, reviewListId }) => {
+        try {
+          checkInit();
+          const cardId = this.semantics.extractCardId(rawId);
+          const updated = await this.client.updateCard(cardId, { idList: reviewListId, dueComplete: true });
+          return { content: [{ type: "text", text: JSON.stringify(updated, null, 2) }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
       }
+    );
 
-      case "search_members": {
-        const { boardId, query } = args as any;
-        const members = await client.getBoardMembers(boardId);
-        const q = query.toLowerCase();
-        const filtered = members.filter((m: any) => 
-          m.fullName.toLowerCase().includes(q) || 
-          m.username.toLowerCase().includes(q)
-        );
-        return { content: [{ type: "text", text: JSON.stringify(filtered, null, 2) }] };
+    // 11. update_relationship
+    this.server.tool(
+      "update_relationship",
+      {
+        sourceCardId: z.string().describe("Trello card ID, Short Link, or URL."),
+        targetCardId: z.string().describe("Trello card ID, Short Link, or URL."),
+        relationshipType: z.enum(["parent-child", "blocker-blocked", "related"]),
+        action: z.enum(["link", "unlink"])
+      },
+      async ({ sourceCardId: rawSource, targetCardId: rawTarget, relationshipType, action }) => {
+        try {
+          checkInit();
+          const sourceId = this.semantics.extractCardId(rawSource);
+          const targetId = this.semantics.extractCardId(rawTarget);
+          const sourceCard = await this.client.getCard(sourceId);
+          const targetCard = await this.client.getCard(targetId);
+          await this.semantics.updateRelationship(sourceCard, targetCard, relationshipType, action);
+          return { content: [{ type: "text", text: "Successfully updated relationship." }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
       }
-      
-      case "create_label": {
-        const { boardId, name, color } = args as any;
-        const label = await client.createLabel(boardId, name, color);
-        return { content: [{ type: "text", text: JSON.stringify(label, null, 2) }] };
-      }
+    );
 
-      case "add_label_to_card": {
-        const { cardId: rawId, labelId } = args as any;
-        const cardId = semantics.extractCardId(rawId);
-        await client.addLabelToCard(cardId, labelId);
-        return { content: [{ type: "text", text: "Label added successfully." }] };
+    // 12. add_comment
+    this.server.tool(
+      "add_comment",
+      {
+        cardId: z.string().describe("Trello card ID, Short Link, or URL."),
+        text: z.string()
+      },
+      async ({ cardId: rawId, text }) => {
+        try {
+          checkInit();
+          const cardId = this.semantics.extractCardId(rawId);
+          await this.client.addComment(cardId, text);
+          return { content: [{ type: "text", text: "Comment added." }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
       }
+    );
 
-      case "remove_label_from_card": {
-        const { cardId: rawId, labelId } = args as any;
-        const cardId = semantics.extractCardId(rawId);
-        await client.removeLabelFromCard(cardId, labelId);
-        return { content: [{ type: "text", text: "Label removed successfully." }] };
+    // 13. search_members
+    this.server.tool(
+      "search_members",
+      {
+        boardId: z.string(),
+        query: z.string().describe("Name or username to search for.")
+      },
+      async ({ boardId, query }) => {
+        try {
+          checkInit();
+          const members = await this.client.getBoardMembers(boardId);
+          const q = query.toLowerCase();
+          const filtered = members.filter((m: any) =>
+            m.fullName?.toLowerCase().includes(q) ||
+            m.username?.toLowerCase().includes(q)
+          );
+          return { content: [{ type: "text", text: JSON.stringify(filtered, null, 2) }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
       }
+    );
 
-      default:
-        throw new Error(`Unknown tool: ${name}`);
-    }
-  } catch (error: any) {
-    return {
-      content: [{ type: "text", text: `Error: ${error.message}` }],
-      isError: true
-    };
+    // 14. create_label
+    this.server.tool(
+      "create_label",
+      {
+        boardId: z.string(),
+        name: z.string(),
+        color: z.enum(["yellow", "purple", "blue", "red", "green", "orange", "black", "sky", "pink", "lime"])
+      },
+      async ({ boardId, name, color }) => {
+        try {
+          checkInit();
+          const label = await this.client.createLabel(boardId, name, color);
+          return { content: [{ type: "text", text: JSON.stringify(label, null, 2) }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
+      }
+    );
+
+    // 15. add_label_to_card
+    this.server.tool(
+      "add_label_to_card",
+      {
+        cardId: z.string().describe("Trello card ID, Short Link, or URL."),
+        labelId: z.string().describe("The ID of the label to add.")
+      },
+      async ({ cardId: rawId, labelId }) => {
+        try {
+          checkInit();
+          const cardId = this.semantics.extractCardId(rawId);
+          await this.client.addLabelToCard(cardId, labelId);
+          return { content: [{ type: "text", text: "Label added successfully." }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
+      }
+    );
+
+    // 16. remove_label_from_card
+    this.server.tool(
+      "remove_label_from_card",
+      {
+        cardId: z.string().describe("Trello card ID, Short Link, or URL."),
+        labelId: z.string().describe("The ID of the label to remove.")
+      },
+      async ({ cardId: rawId, labelId }) => {
+        try {
+          checkInit();
+          const cardId = this.semantics.extractCardId(rawId);
+          await this.client.removeLabelFromCard(cardId, labelId);
+          return { content: [{ type: "text", text: "Label removed successfully." }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
+      }
+    );
   }
-});
-
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
 }
 
-main().catch(console.error);
+export default {
+  fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/sse" || url.pathname === "/sse/message") {
+      return MartelloMCP.serveSSE("/sse").fetch(request, env, ctx);
+    }
+
+    if (url.pathname === "/mcp") {
+      return MartelloMCP.serve("/mcp").fetch(request, env, ctx);
+    }
+
+    return new Response(
+      "Martello MCP Server (Cloudflare Worker) - Available endpoints: /sse, /mcp",
+      {
+        status: 200,
+        headers: { "Content-Type": "text/plain" }
+      }
+    );
+  }
+};
