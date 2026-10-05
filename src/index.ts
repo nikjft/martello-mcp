@@ -617,28 +617,59 @@ export class MartelloMCP extends McpAgent {
       }
     );
 
+function parseSinceDate(since?: string): Date | null {
+  if (!since || since.toLowerCase() === "all") return null;
+  const now = new Date();
+  const lower = since.toLowerCase();
+  if (lower === "today") {
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  } else if (lower === "yesterday") {
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  } else if (lower === "24h") {
+    return new Date(now.getTime() - 24 * 3600 * 1000);
+  } else if (lower === "7d") {
+    return new Date(now.getTime() - 7 * 86400 * 1000);
+  } else if (lower === "14d") {
+    return new Date(now.getTime() - 14 * 86400 * 1000);
+  } else if (lower === "30d") {
+    return new Date(now.getTime() - 30 * 86400 * 1000);
+  } else {
+    const parsed = new Date(since);
+    return isNaN(parsed.getTime()) ? null : parsed;
+  }
+}
+
     // 17. get_notifications (per trello-notifs scope-reduction logic)
     this.server.tool(
       "get_notifications",
       {
         lookback: z.enum(["unread", "7d", "14d", "30d", "all"]).optional().default("unread").describe("Lookback window: 'unread' (default, limits to unread notifications), '7d', '14d', '30d', or 'all'."),
+        since: z.string().optional().describe("Optional date/time delta filter: 'today', 'yesterday', '24h', '7d', '14d', '30d', 'all', or an ISO 8601 date string (e.g. '2026-10-01'). Limits notifications to those on or after this timestamp. Can be combined with lookback='unread' for unread deltas, or lookback='all' for all activity deltas."),
         boardId: z.string().optional().describe("Optional board ID or name substring to filter notifications to a single board."),
         groupBy: z.enum(["card", "board", "flat"]).optional().default("card").describe("How to group results: 'card' (default, clusters all notifications by card), 'board' (groups by board), or 'flat' (list of individual notifications)."),
         includeCardDetails: z.boolean().optional().default(false).describe("If true, fetches full card details (list name, description, recent comments, assignees) for each card in the results."),
         includeAllTypes: z.boolean().optional().default(false).describe("If true, disables the trello-notifs scope reduction filter and returns all Trello notification types instead of only addedToCard, mentionedOnCard, and commentCard.")
       },
-      async ({ lookback, boardId, groupBy, includeCardDetails, includeAllTypes }) => {
+      async ({ lookback, since, boardId, groupBy, includeCardDetails, includeAllTypes }) => {
         try {
           checkInit();
 
+          const sinceCutoff = parseSinceDate(since);
           const days = lookback === "7d" ? 7 : lookback === "14d" ? 14 : lookback === "30d" ? 30 : null;
-          const cutoff = days ? new Date(Date.now() - days * 86400 * 1000) : null;
+          const lookbackCutoff = days ? new Date(Date.now() - days * 86400 * 1000) : null;
+
+          const cutoff = sinceCutoff && lookbackCutoff
+            ? (sinceCutoff > lookbackCutoff ? sinceCutoff : lookbackCutoff)
+            : (sinceCutoff || lookbackCutoff);
+
+          // If lookback is 'unread' and no explicit 'all' request, fetch unread (or all if since was specified without explicitly wanting only unread)
+          const readFilter = (lookback === "unread" && !since) ? "unread" : ((lookback === "unread" && since) ? "unread" : "all");
 
           const [me, openBoards, rawNotifs] = await Promise.all([
             this.client.getCurrentMember().catch(() => null),
             this.client.getMyBoards().catch(() => []),
             this.client.getNotifications({
-              read_filter: (cutoff || lookback === "all") ? "all" : "unread",
+              read_filter: readFilter,
               limit: (cutoff || lookback === "all") ? 1000 : 200
             })
           ]);
@@ -654,7 +685,7 @@ export class MartelloMCP extends McpAgent {
                 return false;
               }
             }
-            // Cutoff filter
+            // Cutoff filter (delta threshold)
             if (cutoff && new Date(n.date) < cutoff) return false;
 
             // EXCLUDE CLOSED/ARCHIVED BOARDS:
@@ -1091,33 +1122,7 @@ export class MartelloMCP extends McpAgent {
           });
 
           // Apply 'since' date filter
-          let sinceDate: Date | null = null;
-          if (since && since !== "all") {
-            const now = Date.now();
-            if (since === "today") {
-              const d = new Date();
-              d.setUTCHours(0, 0, 0, 0);
-              sinceDate = d;
-            } else if (since === "yesterday") {
-              const d = new Date();
-              d.setDate(d.getDate() - 1);
-              d.setUTCHours(0, 0, 0, 0);
-              sinceDate = d;
-            } else if (since === "24h") {
-              sinceDate = new Date(now - 24 * 3600 * 1000);
-            } else if (since === "7d") {
-              sinceDate = new Date(now - 7 * 86400 * 1000);
-            } else if (since === "14d") {
-              sinceDate = new Date(now - 14 * 86400 * 1000);
-            } else if (since === "30d") {
-              sinceDate = new Date(now - 30 * 86400 * 1000);
-            } else {
-              const parsed = new Date(since);
-              if (!isNaN(parsed.getTime())) {
-                sinceDate = parsed;
-              }
-            }
-          }
+          const sinceDate = parseSinceDate(since);
 
           let filteredCards = cardsWithActivity;
           if (sinceDate) {
