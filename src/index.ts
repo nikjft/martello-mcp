@@ -6,7 +6,9 @@ import { TrelloClient } from "./trello-client.js";
 import { McGawSemantics } from "./semantics.js";
 
 import {
+  computeCodeChallenge,
   exchangeAtlassianCode,
+  generateCodeVerifier,
   refreshAtlassianToken,
   signState,
   StoredAuthCode,
@@ -700,6 +702,9 @@ export default {
 
       // If Atlassian OAuth credentials configured: Use Atlassian OAuth 2.0 (3LO)
       if (env.TRELLO_CLIENT_ID && env.TRELLO_CLIENT_SECRET) {
+        const atlassianVerifier = generateCodeVerifier();
+        const atlassianChallenge = await computeCodeChallenge(atlassianVerifier);
+
         const signedState = await signState(
           {
             redirectUri,
@@ -707,6 +712,7 @@ export default {
             codeChallenge,
             codeChallengeMethod,
             clientId,
+            atlassianCodeVerifier: atlassianVerifier,
             timestamp: Date.now()
           },
           env.TRELLO_CLIENT_SECRET
@@ -723,6 +729,8 @@ export default {
         atlassianAuthUrl.searchParams.set("state", signedState);
         atlassianAuthUrl.searchParams.set("response_type", "code");
         atlassianAuthUrl.searchParams.set("prompt", "consent");
+        atlassianAuthUrl.searchParams.set("code_challenge", atlassianChallenge);
+        atlassianAuthUrl.searchParams.set("code_challenge_method", "S256");
 
         return Response.redirect(atlassianAuthUrl.toString(), 302);
       }
@@ -766,7 +774,8 @@ export default {
           env.TRELLO_CLIENT_ID,
           env.TRELLO_CLIENT_SECRET,
           code,
-          `${url.origin}/oauth/callback`
+          `${url.origin}/oauth/callback`,
+          verifiedState.atlassianCodeVerifier
         );
 
         const authCode = crypto.randomUUID();

@@ -22,7 +22,33 @@ export interface OAuthStatePayload {
   codeChallenge: string;
   codeChallengeMethod: string;
   clientId: string;
+  atlassianCodeVerifier?: string;
   timestamp: number;
+}
+
+/**
+ * Generates a high-entropy PKCE code verifier (base64url encoded 32 random bytes).
+ */
+export function generateCodeVerifier(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+/**
+ * Computes S256 code challenge for PKCE.
+ */
+export async function computeCodeChallenge(verifier: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(verifier);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
 }
 
 /**
@@ -125,20 +151,27 @@ export async function exchangeAtlassianCode(
   clientId: string,
   clientSecret: string,
   code: string,
-  redirectUri: string
+  redirectUri: string,
+  codeVerifier?: string
 ): Promise<{ access_token: string; refresh_token?: string; expires_in?: number; scope?: string }> {
+  const bodyPayload: Record<string, string> = {
+    grant_type: "authorization_code",
+    client_id: clientId,
+    client_secret: clientSecret,
+    code,
+    redirect_uri: redirectUri
+  };
+
+  if (codeVerifier) {
+    bodyPayload.code_verifier = codeVerifier;
+  }
+
   const res = await fetch("https://auth.atlassian.com/oauth/token", {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
     },
-    body: JSON.stringify({
-      grant_type: "authorization_code",
-      client_id: clientId,
-      client_secret: clientSecret,
-      code,
-      redirect_uri: redirectUri
-    })
+    body: JSON.stringify(bodyPayload)
   });
 
   if (!res.ok) {
