@@ -4,7 +4,11 @@ import {
   TrelloChecklist,
   TrelloList,
   TrelloConfig,
-  TrelloCustomField
+  TrelloCustomField,
+  TrelloMember,
+  TrelloNotification,
+  CardComment,
+  CardDetail
 } from './types.js';
 
 const DELAY_MS = 120;
@@ -232,4 +236,76 @@ export class TrelloClient {
       body: { name, color }
     });
   }
+
+  async getCurrentMember(): Promise<TrelloMember> {
+    return this.request('/members/me', {
+      params: { fields: 'id,username,fullName' }
+    });
+  }
+
+  async getNotifications(params: { read_filter?: string; limit?: number } = {}): Promise<TrelloNotification[]> {
+    return this.request('/members/me/notifications', {
+      params: {
+        read_filter: params.read_filter || 'unread',
+        limit: params.limit || 200
+      }
+    });
+  }
+
+  async markNotificationRead(id: string): Promise<void> {
+    await this.request(`/notifications/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: { unread: false }
+    });
+  }
+
+  async getCardComments(cardId: string, limit: number = 14): Promise<CardComment[]> {
+    const actions: any[] = await this.request(`/cards/${encodeURIComponent(cardId)}/actions`, {
+      params: { filter: 'commentCard', limit }
+    });
+    return (actions || []).map(a => ({
+      id: a.id,
+      date: a.date,
+      text: a.data?.text || '',
+      author: a.memberCreator?.fullName || a.memberCreator?.username || 'Unknown',
+      authorUsername: a.memberCreator?.username || ''
+    }));
+  }
+
+  async getList(listId: string): Promise<TrelloList> {
+    return this.request(`/lists/${encodeURIComponent(listId)}`);
+  }
+
+  async getCardDetail(cardId: string): Promise<CardDetail> {
+    const [card, comments]: [any, CardComment[]] = await Promise.all([
+      this.request(`/cards/${encodeURIComponent(cardId)}`, {
+        params: { fields: 'id,name,dueComplete,due,idList,desc', members: 'true' }
+      }),
+      this.getCardComments(cardId, 14)
+    ]);
+
+    let listName: string | undefined;
+    if (card.idList) {
+      try {
+        const list = await this.getList(card.idList);
+        listName = list.name;
+      } catch {}
+    }
+
+    return {
+      id: card.id,
+      name: card.name,
+      dueComplete: card.dueComplete ?? false,
+      due: card.due,
+      listName,
+      desc: card.desc || undefined,
+      comments,
+      assignees: (card.members || []).map((m: any) => ({
+        id: m.id,
+        fullName: m.fullName,
+        username: m.username
+      }))
+    };
+  }
 }
+

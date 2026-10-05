@@ -588,6 +588,328 @@ export class MartelloMCP extends McpAgent {
         }
       }
     );
+
+    // 17. get_notifications (per trello-notifs scope-reduction logic)
+    this.server.tool(
+      "get_notifications",
+      {
+        lookback: z.enum(["unread", "7d", "14d", "30d", "all"]).optional().default("unread").describe("Lookback window: 'unread' (default, limits to unread notifications), '7d', '14d', '30d', or 'all'."),
+        boardId: z.string().optional().describe("Optional board ID or name substring to filter notifications to a single board."),
+        groupBy: z.enum(["card", "board", "flat"]).optional().default("card").describe("How to group results: 'card' (default, clusters all notifications by card), 'board' (groups by board), or 'flat' (list of individual notifications)."),
+        includeCardDetails: z.boolean().optional().default(false).describe("If true, fetches full card details (list name, description, recent comments, assignees) for each card in the results."),
+        includeAllTypes: z.boolean().optional().default(false).describe("If true, disables the trello-notifs scope reduction filter and returns all Trello notification types instead of only addedToCard, mentionedOnCard, and commentCard.")
+      },
+      async ({ lookback, boardId, groupBy, includeCardDetails, includeAllTypes }) => {
+        try {
+          checkInit();
+
+          const days = lookback === "7d" ? 7 : lookback === "14d" ? 14 : lookback === "30d" ? 30 : null;
+          const cutoff = days ? new Date(Date.now() - days * 86400 * 1000) : null;
+
+          const [me, rawNotifs] = await Promise.all([
+            this.client.getCurrentMember().catch(() => null),
+            this.client.getNotifications({
+              read_filter: (cutoff || lookback === "all") ? "all" : "unread",
+              limit: (cutoff || lookback === "all") ? 1000 : 200
+            })
+          ]);
+
+          const myId = me?.id;
+          let filtered = rawNotifs.filter(n => {
+            // Exclude self-actions
+            if (myId && n.idMemberCreator === myId) return false;
+            // Scope reduction noise filter per trello-notifs logic
+            if (!includeAllTypes) {
+              if (n.type !== "addedToCard" && n.type !== "mentionedOnCard" && n.type !== "commentCard") {
+                return false;
+              }
+            }
+            // Cutoff filter
+            if (cutoff && new Date(n.date) < cutoff) return false;
+            return true;
+          });
+
+          // Optional board filter
+          if (boardId) {
+            const bQuery = boardId.toLowerCase();
+            filtered = filtered.filter(n =>
+              n.data.board?.id === boardId ||
+              (n.data.board?.name && n.data.board.name.toLowerCase().includes(bQuery))
+            );
+          }
+
+          if (groupBy === "flat") {
+            const output = {
+              total: filtered.length,
+              notifications: filtered.map(n => ({
+                id: n.id,
+                type: n.type,
+                date: n.date,
+                unread: n.unread,
+                author: n.memberCreator?.fullName || n.memberCreator?.username || "Unknown",
+                authorUsername: n.memberCreator?.username,
+                board: n.data.board ? { id: n.data.board.id, name: n.data.board.name } : undefined,
+                card: n.data.card ? { id: n.data.card.id, name: n.data.card.name, shortLink: n.data.card.shortLink } : undefined,
+                snippet: n.data.text
+              }))
+            };
+            return { content: [{ type: "text", text: JSON.stringify(output, null, 2) }] };
+          }
+
+          if (groupBy === "board") {
+            const boardGroups: Record<string, { boardId: string; boardName: string; count: number; cards: Record<string, any> }> = {};
+            for (const n of filtered) {
+              const bId = n.data.board?.id || "unknown";
+              const bName = n.data.board?.name || "Unknown Board";
+              if (!boardGroups[bId]) {
+                boardGroups[bId] = { boardId: bId, boardName: bName, count: 0, cards: {} };
+              }
+              boardGroups[bId].count++;
+              const cId = n.data.card?.id || "general";
+              const cName = n.data.card?.name || "General / Board level notification";
+              if (!boardGroups[bId].cards[cId]) {
+                boardGroups[bId].cards[cId] = {
+                  cardId: cId,
+                  cardName: cName,
+                  unreadCount: 0,
+                  notificationIds: [],
+                  latestDate: n.date,
+                  items: []
+                };
+              }
+              const cardEntry = boardGroups[bId].cards[cId];
+              if (n.unread) cardEntry.unreadCount++;
+              cardEntry.notificationIds.push(n.id);
+              if (new Date(n.date) > new Date(cardEntry.latestDate)) {
+                cardEntry.latestDate = n.date;
+              }
+              cardEntry.items.push({
+                id: n.id,
+                type: n.type,
+                date: n.date,
+                unread: n.unread,
+                author: n.memberCreator?.fullName || n.memberCreator?.username || "Unknown",
+                snippet: n.data.text
+              });
+            }
+
+            const output = {
+              totalNotifications: filtered.length,
+              boards: Object.values(boardGroups).map(b => ({
+                ...b,
+                cards: Object.values(b.cards).sort((x, y) => new Date(y.latestDate).getTime() - new Date(x.latestDate).getTime())
+              }))
+            };
+            return { content: [{ type: "text", text: JSON.stringify(output, null, 2) }] };
+          }
+
+          // Default: groupBy === "card"
+          const cardMap = new Map<string, {
+            cardId: string;
+            cardName: string;
+            boardId?: string;
+            boardName?: string;
+            unreadCount: number;
+            notificationIds: string[];
+            latestDate: string;
+            items: any[];
+            cardDetail?: any;
+          }>();
+
+          for (const n of filtered) {
+            const cardId = n.data.card?.id || "general";
+            const cardName = n.data.card?.name || "General / Non-card notification";
+            if (!cardMap.has(cardId)) {
+              cardMap.set(cardId, {
+                cardId,
+                cardName,
+                boardId: n.data.board?.id,
+                boardName: n.data.board?.name,
+                unreadCount: 0,
+                notificationIds: [],
+                latestDate: n.date,
+                items: []
+              });
+            }
+            const group = cardMap.get(cardId)!;
+            if (n.unread) group.unreadCount++;
+            group.notificationIds.push(n.id);
+            if (new Date(n.date) > new Date(group.latestDate)) {
+              group.latestDate = n.date;
+            }
+            group.items.push({
+              id: n.id,
+              type: n.type,
+              date: n.date,
+              unread: n.unread,
+              author: n.memberCreator?.fullName || n.memberCreator?.username || "Unknown",
+              authorUsername: n.memberCreator?.username,
+              snippet: n.data.text
+            });
+          }
+
+          const cards = Array.from(cardMap.values()).sort(
+            (a, b) => new Date(b.latestDate).getTime() - new Date(a.latestDate).getTime()
+          );
+
+          if (includeCardDetails) {
+            for (const c of cards) {
+              if (c.cardId && c.cardId !== "general") {
+                try {
+                  c.cardDetail = await this.client.getCardDetail(c.cardId);
+                } catch {}
+              }
+            }
+          }
+
+          const output = {
+            totalNotifications: filtered.length,
+            totalCards: cards.length,
+            cards
+          };
+          return { content: [{ type: "text", text: JSON.stringify(output, null, 2) }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
+      }
+    );
+
+    // 18. get_notification_card_detail
+    this.server.tool(
+      "get_notification_card_detail",
+      {
+        cardId: z.string().describe("Trello card ID, Short Link, or URL.")
+      },
+      async ({ cardId: rawId }) => {
+        try {
+          checkInit();
+          const cardId = this.semantics.extractCardId(rawId);
+
+          const [cardDetail, unreadNotifs] = await Promise.all([
+            this.client.getCardDetail(cardId),
+            this.client.getNotifications({ read_filter: "unread", limit: 200 }).catch(() => [])
+          ]);
+
+          const cardNotifs = unreadNotifs.filter(n =>
+            n.data.card?.id === cardId ||
+            (n.data.card?.shortLink && rawId.includes(n.data.card.shortLink))
+          );
+
+          cardDetail.associatedNotificationIds = cardNotifs.map(n => n.id);
+
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                card: cardDetail,
+                unreadNotificationCount: cardNotifs.length,
+                associatedNotificationIds: cardDetail.associatedNotificationIds
+              }, null, 2)
+            }]
+          };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
+      }
+    );
+
+    // 19. mark_notifications_read
+    this.server.tool(
+      "mark_notifications_read",
+      {
+        notificationIds: z.array(z.string()).optional().describe("Specific notification IDs to mark as read."),
+        cardId: z.string().optional().describe("Trello card ID or Short Link. Marks all unread notifications for this card as read."),
+        boardId: z.string().optional().describe("Trello board ID. Marks all unread notifications for this board as read."),
+        allUnread: z.boolean().optional().describe("If true, marks all currently unread actionable notifications as read.")
+      },
+      async ({ notificationIds, cardId: rawCardId, boardId, allUnread }) => {
+        try {
+          checkInit();
+          const idsToMark = new Set<string>(notificationIds || []);
+
+          if (rawCardId || boardId || allUnread) {
+            const resolvedCardId = rawCardId ? this.semantics.extractCardId(rawCardId) : null;
+            const unread = await this.client.getNotifications({ read_filter: "unread", limit: 500 });
+            for (const n of unread) {
+              if (resolvedCardId && (n.data.card?.id === resolvedCardId || (n.data.card?.shortLink && rawCardId?.includes(n.data.card.shortLink)))) {
+                idsToMark.add(n.id);
+              }
+              if (boardId && n.data.board?.id === boardId) {
+                idsToMark.add(n.id);
+              }
+              if (allUnread) {
+                if (n.type === "addedToCard" || n.type === "mentionedOnCard" || n.type === "commentCard") {
+                  idsToMark.add(n.id);
+                }
+              }
+            }
+          }
+
+          if (idsToMark.size === 0) {
+            return { content: [{ type: "text", text: "No matching unread notifications found to mark as read." }] };
+          }
+
+          const idList = Array.from(idsToMark);
+          await Promise.all(idList.map(id => this.client.markNotificationRead(id)));
+
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                success: true,
+                markedReadCount: idList.length,
+                markedNotificationIds: idList
+              }, null, 2)
+            }]
+          };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
+      }
+    );
+
+    // 20. reply_to_notification
+    this.server.tool(
+      "reply_to_notification",
+      {
+        cardId: z.string().describe("Trello card ID, Short Link, or URL to post comment on."),
+        text: z.string().describe("Comment text to post on the card."),
+        markRead: z.boolean().optional().default(true).describe("Whether to automatically mark the card's notifications as read after posting the comment.")
+      },
+      async ({ cardId: rawId, text, markRead }) => {
+        try {
+          checkInit();
+          const cardId = this.semantics.extractCardId(rawId);
+          await this.client.addComment(cardId, text);
+
+          let markedCount = 0;
+          if (markRead) {
+            const unread = await this.client.getNotifications({ read_filter: "unread", limit: 200 }).catch(() => []);
+            const matchingIds = unread
+              .filter(n => n.data.card?.id === cardId || (n.data.card?.shortLink && rawId.includes(n.data.card.shortLink)))
+              .map(n => n.id);
+            if (matchingIds.length > 0) {
+              await Promise.all(matchingIds.map(id => this.client.markNotificationRead(id)));
+              markedCount = matchingIds.length;
+            }
+          }
+
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                success: true,
+                cardId,
+                commentPosted: text,
+                markedNotificationsRead: markedCount
+              }, null, 2)
+            }]
+          };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
+      }
+    );
   }
 }
 
