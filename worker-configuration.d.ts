@@ -4,6 +4,8 @@
 interface __BaseEnv_Env {
 	TRELLO_API_KEY: string;
 	TRELLO_TOKEN: string;
+	TRELLO_CLIENT_ID?: string;
+	TRELLO_CLIENT_SECRET?: string;
 	MCP_OBJECT: DurableObjectNamespace<import("./src/index").MartelloMCP>;
 }
 declare namespace Cloudflare {

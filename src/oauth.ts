@@ -2,26 +2,94 @@ export interface StoredAuthCode {
   code: string;
   codeChallenge: string;
   codeChallengeMethod: string;
-  trelloToken: string;
+  atlassianAccessToken: string;
+  atlassianRefreshToken?: string;
   expiresAt: number;
 }
 
 export interface StoredSession {
   mcpAccessToken: string;
   mcpRefreshToken: string;
-  trelloToken: string;
+  atlassianAccessToken: string;
+  atlassianRefreshToken?: string;
   expiresAt: number;
   createdAt: number;
 }
 
-export interface PendingAuthRequest {
-  nonce: string;
+export interface OAuthStatePayload {
   redirectUri: string;
   clientState: string;
   codeChallenge: string;
   codeChallengeMethod: string;
   clientId: string;
-  expiresAt: number;
+  timestamp: number;
+}
+
+/**
+ * Signs state with HMAC-SHA256.
+ */
+export async function signState(payload: OAuthStatePayload, secret: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = JSON.stringify(payload);
+  const base64Data = btoa(data).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(base64Data));
+  const base64Sig = btoa(String.fromCharCode(...new Uint8Array(signature)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+
+  return `${base64Data}.${base64Sig}`;
+}
+
+/**
+ * Verifies signed state.
+ */
+export async function verifyState(signedState: string, secret: string): Promise<OAuthStatePayload | null> {
+  const parts = signedState.split(".");
+  if (parts.length !== 2) return null;
+
+  const [base64Data, base64Sig] = parts;
+  const encoder = new TextEncoder();
+
+  try {
+    const key = await crypto.subtle.importKey(
+      "raw",
+      encoder.encode(secret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["verify"]
+    );
+
+    const sigStr = atob(base64Sig.replace(/-/g, "+").replace(/_/g, "/"));
+    const sigBytes = new Uint8Array(sigStr.length);
+    for (let i = 0; i < sigStr.length; i++) {
+      sigBytes[i] = sigStr.charCodeAt(i);
+    }
+
+    const valid = await crypto.subtle.verify("HMAC", key, sigBytes, encoder.encode(base64Data));
+    if (!valid) return null;
+
+    const jsonStr = atob(base64Data.replace(/-/g, "+").replace(/_/g, "/"));
+    const payload = JSON.parse(jsonStr) as OAuthStatePayload;
+
+    // Check expiration (max 15 mins)
+    if (Date.now() - payload.timestamp > 15 * 60 * 1000) {
+      return null;
+    }
+
+    return payload;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -48,4 +116,64 @@ export async function verifyPkce(
   }
 
   return false;
+}
+
+/**
+ * Exchanges authorization code with Atlassian.
+ */
+export async function exchangeAtlassianCode(
+  clientId: string,
+  clientSecret: string,
+  code: string,
+  redirectUri: string
+): Promise<{ access_token: string; refresh_token?: string; expires_in?: number; scope?: string }> {
+  const res = await fetch("https://auth.atlassian.com/oauth/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      grant_type: "authorization_code",
+      client_id: clientId,
+      client_secret: clientSecret,
+      code,
+      redirect_uri: redirectUri
+    })
+  });
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    throw new Error(`Failed to exchange Atlassian code: ${res.status} ${errorText}`);
+  }
+
+  return res.json();
+}
+
+/**
+ * Refreshes an expired Atlassian access token.
+ */
+export async function refreshAtlassianToken(
+  clientId: string,
+  clientSecret: string,
+  refreshToken: string
+): Promise<{ access_token: string; refresh_token?: string; expires_in?: number }> {
+  const res = await fetch("https://auth.atlassian.com/oauth/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      grant_type: "refresh_token",
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: refreshToken
+    })
+  });
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    throw new Error(`Failed to refresh Atlassian token: ${res.status} ${errorText}`);
+  }
+
+  return res.json();
 }

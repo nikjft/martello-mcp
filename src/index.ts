@@ -6,10 +6,13 @@ import { TrelloClient } from "./trello-client.js";
 import { McGawSemantics } from "./semantics.js";
 
 import {
-  PendingAuthRequest,
+  exchangeAtlassianCode,
+  refreshAtlassianToken,
+  signState,
   StoredAuthCode,
   StoredSession,
-  verifyPkce
+  verifyPkce,
+  verifyState
 } from "./oauth.js";
 
 export class MartelloMCP extends McpAgent {
@@ -29,19 +32,6 @@ export class MartelloMCP extends McpAgent {
   }
 
   // --- RPC Methods for OAuth State & Session Management ---
-
-  async storePendingAuth(data: PendingAuthRequest): Promise<boolean> {
-    await this.ctx.storage.put("pending:" + data.nonce, data);
-    return true;
-  }
-
-  async getPendingAuth(nonce: string): Promise<PendingAuthRequest | null> {
-    const data = await this.ctx.storage.get<PendingAuthRequest>("pending:" + nonce);
-    if (!data) return null;
-    await this.ctx.storage.delete("pending:" + nonce);
-    if (data.expiresAt < Date.now()) return null;
-    return data;
-  }
 
   async storeAuthCode(data: StoredAuthCode): Promise<boolean> {
     await this.ctx.storage.put("code:" + data.code, data);
@@ -71,7 +61,8 @@ export class MartelloMCP extends McpAgent {
     const session: StoredSession = {
       mcpAccessToken,
       mcpRefreshToken,
-      trelloToken: stored.trelloToken,
+      atlassianAccessToken: stored.atlassianAccessToken,
+      atlassianRefreshToken: stored.atlassianRefreshToken,
       expiresAt: Date.now() + 30 * 24 * 3600 * 1000,
       createdAt: Date.now()
     };
@@ -90,7 +81,7 @@ export class MartelloMCP extends McpAgent {
     };
   }
 
-  async refreshMcpSession(refreshToken: string): Promise<any> {
+  async refreshMcpSession(refreshToken: string, clientId?: string, clientSecret?: string): Promise<any> {
     const tokenKey = await this.ctx.storage.get<string>("refresh:" + refreshToken);
     if (!tokenKey) {
       return { status: 400, data: { error: "invalid_grant", error_description: "Invalid refresh token" } };
@@ -99,6 +90,18 @@ export class MartelloMCP extends McpAgent {
     const session = await this.ctx.storage.get<StoredSession>("session:" + tokenKey);
     if (!session) {
       return { status: 400, data: { error: "invalid_grant", error_description: "Session not found" } };
+    }
+
+    if (session.atlassianRefreshToken && clientId && clientSecret) {
+      try {
+        const refreshed = await refreshAtlassianToken(clientId, clientSecret, session.atlassianRefreshToken);
+        session.atlassianAccessToken = refreshed.access_token;
+        if (refreshed.refresh_token) {
+          session.atlassianRefreshToken = refreshed.refresh_token;
+        }
+      } catch (err) {
+        console.warn("Failed to refresh Atlassian token:", err);
+      }
     }
 
     const newAccessToken = "mcp_at_" + crypto.randomUUID().replace(/-/g, "");
@@ -120,7 +123,7 @@ export class MartelloMCP extends McpAgent {
     };
   }
 
-  async resolveSession(token: string): Promise<{ valid: boolean; trelloToken?: string }> {
+  async resolveSession(token: string, clientId?: string, clientSecret?: string): Promise<{ valid: boolean; trelloToken?: string }> {
     const session = await this.ctx.storage.get<StoredSession>("session:" + token);
     if (!session) {
       return { valid: false };
@@ -129,9 +132,23 @@ export class MartelloMCP extends McpAgent {
       await this.ctx.storage.delete("session:" + token);
       return { valid: false };
     }
+
+    if (session.atlassianRefreshToken && clientId && clientSecret && session.expiresAt - Date.now() < 24 * 3600 * 1000) {
+      try {
+        const refreshed = await refreshAtlassianToken(clientId, clientSecret, session.atlassianRefreshToken);
+        session.atlassianAccessToken = refreshed.access_token;
+        if (refreshed.refresh_token) {
+          session.atlassianRefreshToken = refreshed.refresh_token;
+        }
+        await this.ctx.storage.put("session:" + token, session);
+      } catch {
+        // Ignore refresh errors
+      }
+    }
+
     return {
       valid: true,
-      trelloToken: session.trelloToken
+      trelloToken: session.atlassianAccessToken
     };
   }
 
@@ -579,87 +596,6 @@ const CORS_HEADERS = {
   "Access-Control-Expose-Headers": "mcp-session-id, WWW-Authenticate, Authorization"
 };
 
-const CALLBACK_HTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Connecting Trello to Claude...</title>
-  <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 100vh;
-      margin: 0;
-      background: #0f172a;
-      color: #f8fafc;
-    }
-    .card {
-      background: #1e293b;
-      padding: 2.5rem;
-      border-radius: 16px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-      text-align: center;
-      max-width: 420px;
-      border: 1px solid #334155;
-    }
-    h2 { margin: 0 0 0.5rem 0; font-size: 1.5rem; }
-    p { color: #94a3b8; font-size: 0.95rem; margin: 0.5rem 0 1.5rem 0; }
-    .spinner {
-      border: 3px solid #334155;
-      border-top: 3px solid #38bdf8;
-      border-radius: 50%;
-      width: 40px;
-      height: 40px;
-      animation: spin 1s linear infinite;
-      margin: 1.5rem auto;
-    }
-    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h2>Connecting Trello</h2>
-    <div class="spinner"></div>
-    <p id="status">Completing authorization with Claude...</p>
-  </div>
-  <script>
-    async function handleAuth() {
-      const hash = window.location.hash.substring(1);
-      const hashParams = new URLSearchParams(hash);
-      const token = hashParams.get('token');
-
-      const urlParams = new URLSearchParams(window.location.search);
-      const nonce = urlParams.get('nonce');
-
-      if (!token) {
-        document.getElementById('status').innerText = 'Authorization was denied or no token was returned. Please close this window and try again.';
-        return;
-      }
-
-      try {
-        const res = await fetch('/oauth/trello-token-submit', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token, nonce })
-        });
-        const data = await res.json();
-        if (data.redirect) {
-          window.location.href = data.redirect;
-        } else {
-          document.getElementById('status').innerText = 'Error: ' + (data.error || 'Failed to complete authorization');
-        }
-      } catch (err) {
-        document.getElementById('status').innerText = 'Network error: ' + err.message;
-      }
-    }
-    handleAuth();
-  </script>
-</body>
-</html>`;
-
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -762,105 +698,99 @@ export default {
         return new Response("Missing redirect_uri or code_challenge parameter", { status: 400 });
       }
 
+      // If Atlassian OAuth credentials configured: Use Atlassian OAuth 2.0 (3LO)
+      if (env.TRELLO_CLIENT_ID && env.TRELLO_CLIENT_SECRET) {
+        const signedState = await signState(
+          {
+            redirectUri,
+            clientState: state,
+            codeChallenge,
+            codeChallengeMethod,
+            clientId,
+            timestamp: Date.now()
+          },
+          env.TRELLO_CLIENT_SECRET
+        );
+
+        const atlassianAuthUrl = new URL("https://auth.atlassian.com/authorize");
+        atlassianAuthUrl.searchParams.set("audience", "api.atlassian.com");
+        atlassianAuthUrl.searchParams.set("client_id", env.TRELLO_CLIENT_ID);
+        atlassianAuthUrl.searchParams.set(
+          "scope",
+          "read:board:trello write:board:trello read:member:trello write:card:trello offline_access"
+        );
+        atlassianAuthUrl.searchParams.set("redirect_uri", `${url.origin}/oauth/callback`);
+        atlassianAuthUrl.searchParams.set("state", signedState);
+        atlassianAuthUrl.searchParams.set("response_type", "code");
+        atlassianAuthUrl.searchParams.set("prompt", "consent");
+
+        return Response.redirect(atlassianAuthUrl.toString(), 302);
+      }
+
+      // Fallback: Trello Native Token Authorization
       if (!env.TRELLO_API_KEY) {
         return new Response("Server configuration error: TRELLO_API_KEY missing", { status: 500 });
       }
 
-      const nonce = crypto.randomUUID().replace(/-/g, "");
-      const stub = env.MCP_OBJECT.get(env.MCP_OBJECT.idFromName("oauth-storage"));
-
-      await (stub as any).storePendingAuth({
-        nonce,
-        redirectUri,
-        clientState: state,
-        codeChallenge,
-        codeChallengeMethod,
-        clientId,
-        expiresAt: Date.now() + 10 * 60 * 1000
-      });
-
-      const returnUrl = `${url.origin}/oauth/trello-callback?nonce=${nonce}`;
       const trelloAuthUrl = new URL("https://trello.com/1/authorize");
       trelloAuthUrl.searchParams.set("key", env.TRELLO_API_KEY);
       trelloAuthUrl.searchParams.set("name", "Martello MCP");
       trelloAuthUrl.searchParams.set("response_type", "token");
       trelloAuthUrl.searchParams.set("scope", "read,write");
       trelloAuthUrl.searchParams.set("expiration", "never");
-      trelloAuthUrl.searchParams.set("return_url", returnUrl);
-      trelloAuthUrl.searchParams.set("callback_method", "fragment");
+      trelloAuthUrl.searchParams.set("return_url", `${url.origin}/oauth/callback`);
 
-      return new Response(null, {
-        status: 302,
-        headers: {
-          Location: trelloAuthUrl.toString(),
-          "Set-Cookie": `mcp_auth_nonce=${nonce}; Path=/oauth; Max-Age=600; Secure; SameSite=Lax`
-        }
-      });
+      return Response.redirect(trelloAuthUrl.toString(), 302);
     }
 
-    // 3. Trello Token Callback Bridge Page (/oauth/trello-callback)
-    if (url.pathname === "/oauth/trello-callback") {
-      return new Response(CALLBACK_HTML, {
-        status: 200,
-        headers: { "Content-Type": "text/html; charset=utf-8" }
-      });
-    }
+    // 3. Upstream Atlassian OAuth Callback (/oauth/callback)
+    if (url.pathname === "/oauth/callback") {
+      const code = url.searchParams.get("code");
+      const state = url.searchParams.get("state");
 
-    // 3b. Trello Token Submit API (/oauth/trello-token-submit)
-    if (url.pathname === "/oauth/trello-token-submit") {
-      if (request.method !== "POST") {
-        return new Response("Method Not Allowed", { status: 405, headers: CORS_HEADERS });
+      if (!code || !state) {
+        return new Response("Invalid Atlassian OAuth callback: missing code or state", { status: 400 });
       }
 
-      let body: any = {};
+      if (!env.TRELLO_CLIENT_SECRET || !env.TRELLO_CLIENT_ID) {
+        return new Response("Server error: TRELLO_CLIENT_ID or TRELLO_CLIENT_SECRET not configured", { status: 500 });
+      }
+
+      const verifiedState = await verifyState(state, env.TRELLO_CLIENT_SECRET);
+      if (!verifiedState) {
+        return new Response("Invalid or expired OAuth state parameter. Please try logging in again.", { status: 400 });
+      }
+
       try {
-        body = await request.json();
-      } catch {
-        body = {};
-      }
-
-      const token = body.token;
-      let nonce = body.nonce;
-
-      if (!nonce) {
-        const cookie = request.headers.get("Cookie") || "";
-        const match = cookie.match(/mcp_auth_nonce=([a-zA-Z0-9_-]+)/);
-        if (match) nonce = match[1];
-      }
-
-      if (!token || !nonce) {
-        return Response.json(
-          { error: "invalid_request", error_description: "Missing token or authorization nonce" },
-          { status: 400, headers: CORS_HEADERS }
+        const tokens = await exchangeAtlassianCode(
+          env.TRELLO_CLIENT_ID,
+          env.TRELLO_CLIENT_SECRET,
+          code,
+          `${url.origin}/oauth/callback`
         );
+
+        const authCode = crypto.randomUUID();
+        const stub = env.MCP_OBJECT.get(env.MCP_OBJECT.idFromName("oauth-storage"));
+
+        await (stub as any).storeAuthCode({
+          code: authCode,
+          codeChallenge: verifiedState.codeChallenge,
+          codeChallengeMethod: verifiedState.codeChallengeMethod,
+          atlassianAccessToken: tokens.access_token,
+          atlassianRefreshToken: tokens.refresh_token,
+          expiresAt: Date.now() + 10 * 60 * 1000
+        } as StoredAuthCode);
+
+        const returnUrl = new URL(verifiedState.redirectUri);
+        returnUrl.searchParams.set("code", authCode);
+        if (verifiedState.clientState) {
+          returnUrl.searchParams.set("state", verifiedState.clientState);
+        }
+
+        return Response.redirect(returnUrl.toString(), 302);
+      } catch (err: any) {
+        return new Response(`Atlassian OAuth Error: ${err.message}`, { status: 500 });
       }
-
-      const stub = env.MCP_OBJECT.get(env.MCP_OBJECT.idFromName("oauth-storage"));
-      const pending = await (stub as any).getPendingAuth(nonce);
-
-      if (!pending) {
-        return Response.json(
-          { error: "invalid_grant", error_description: "Authorization session expired. Please start again." },
-          { status: 400, headers: CORS_HEADERS }
-        );
-      }
-
-      const authCode = crypto.randomUUID();
-      await (stub as any).storeAuthCode({
-        code: authCode,
-        codeChallenge: pending.codeChallenge,
-        codeChallengeMethod: pending.codeChallengeMethod,
-        trelloToken: token,
-        expiresAt: Date.now() + 10 * 60 * 1000
-      });
-
-      const returnUrl = new URL(pending.redirectUri);
-      returnUrl.searchParams.set("code", authCode);
-      if (pending.clientState) {
-        returnUrl.searchParams.set("state", pending.clientState);
-      }
-
-      return Response.json({ redirect: returnUrl.toString() }, { headers: CORS_HEADERS });
     }
 
     // 4. OAuth 2.0 Token Endpoint (/oauth/token)
@@ -911,7 +841,11 @@ export default {
           );
         }
 
-        const res = await (stub as any).refreshMcpSession(refreshToken);
+        const res = await (stub as any).refreshMcpSession(
+          refreshToken,
+          env.TRELLO_CLIENT_ID,
+          env.TRELLO_CLIENT_SECRET
+        );
         return Response.json(res.data, { status: res.status, headers: CORS_HEADERS });
       }
 
@@ -933,7 +867,11 @@ export default {
         const token = authHeader.slice(7).trim();
         const stub = env.MCP_OBJECT.get(env.MCP_OBJECT.idFromName("oauth-storage"));
 
-        const res = await (stub as any).resolveSession(token);
+        const res = await (stub as any).resolveSession(
+          token,
+          env.TRELLO_CLIENT_ID,
+          env.TRELLO_CLIENT_SECRET
+        );
         if (res?.valid && res.trelloToken) {
           activeTrelloToken = res.trelloToken;
         }

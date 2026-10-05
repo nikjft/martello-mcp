@@ -43,20 +43,24 @@ export class TrelloClient {
 
     const method = options.method || 'GET';
     const url = new URL(`${BASE_URL}${endpoint}`);
-    url.searchParams.set('key', this.apiKey);
-    url.searchParams.set('token', this.token);
-
-    if (options.params) {
-      for (const [key, value] of Object.entries(options.params)) {
-        if (value !== undefined && value !== null) {
-          url.searchParams.set(key, String(value));
-        }
-      }
-    }
 
     const headers: Record<string, string> = {
       'Accept': 'application/json'
     };
+
+    if (this.token && !this.token.startsWith('ATTA') && this.token.length > 30) {
+      headers['Authorization'] = `Bearer ${this.token}`;
+      if (this.apiKey) {
+        url.searchParams.set('key', this.apiKey);
+      }
+    } else {
+      if (this.apiKey) {
+        url.searchParams.set('key', this.apiKey);
+      }
+      if (this.token) {
+        url.searchParams.set('token', this.token);
+      }
+    }
 
     let body: string | undefined;
     if (options.body !== undefined) {
