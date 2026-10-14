@@ -7,6 +7,7 @@ import {
   TrelloCustomField,
   TrelloMember,
   TrelloNotification,
+  TrelloSearchCard,
   CardComment,
   CardDetail
 } from './types.js';
@@ -47,6 +48,12 @@ export class TrelloClient {
 
     const method = options.method || 'GET';
     const url = new URL(`${BASE_URL}${endpoint}`);
+
+    for (const [key, value] of Object.entries(options.params ?? {})) {
+      if (value !== undefined && value !== null) {
+        url.searchParams.set(key, String(value));
+      }
+    }
 
     const headers: Record<string, string> = {
       'Accept': 'application/json'
@@ -139,9 +146,16 @@ export class TrelloClient {
     return this.request(`/boards/${encodeURIComponent(boardId)}/customFields`);
   }
 
-  async searchCards(query: string): Promise<TrelloCard[]> {
-    const res = await this.request<{ cards: TrelloCard[] }>('/search', {
-      params: { query, modelTypes: 'cards', cards_limit: 1000 }
+  async searchCards(query: string): Promise<TrelloSearchCard[]> {
+    const res = await this.request<{ cards: TrelloSearchCard[] }>('/search', {
+      params: {
+        query,
+        modelTypes: 'cards',
+        cards_limit: 1000,
+        card_fields: 'name,idBoard,idList,shortUrl,due,dueComplete,start,labels,idMembers,closed,dateLastActivity',
+        card_list: true,
+        card_board: true
+      }
     });
     return res.cards || [];
   }

@@ -18,6 +18,23 @@ export interface TrelloCard {
   customFieldItems?: { idCustomField: string; value: { date?: string; text?: string; number?: number } }[];
 }
 
+export interface TrelloSearchCard {
+  id: string;
+  name: string;
+  idList: string;
+  idBoard: string;
+  shortUrl: string;
+  due?: string | null;
+  start?: string | null;
+  dueComplete?: boolean;
+  closed?: boolean;
+  dateLastActivity?: string;
+  idMembers?: string[];
+  labels: { id: string; name: string; color: string }[];
+  board?: { id: string; name: string };
+  list?: { id: string; name: string; closed?: boolean };
+}
+
 export interface TrelloList {
   id: string;
   name: string;

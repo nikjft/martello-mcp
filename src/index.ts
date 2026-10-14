@@ -195,23 +195,27 @@ export class MartelloMCP extends McpAgent {
           let finalCards = rawCards.filter(c => !c.closed && openBoardIds.has(c.idBoard));
 
           if (excludeCompletedLists) {
-            const boardIds = [...new Set(finalCards.map(c => c.idBoard))];
-            const listsMap = new Map<string, string>();
-            for (const bid of boardIds) {
-              const lists = await this.client.getBoardLists(bid);
-              for (const l of lists) {
-                listsMap.set(l.id, l.name.toLowerCase());
-              }
-            }
             finalCards = finalCards.filter(c => {
-              const lname = listsMap.get(c.idList);
+              const lname = c.list?.name?.toLowerCase();
               if (!lname) return true;
               return !lname.includes("completed") && !lname.includes("template");
             });
           }
 
           const cardsWithMetadata = finalCards.map(c => ({
-            ...c,
+            id: c.id,
+            name: c.name,
+            shortUrl: c.shortUrl,
+            boardId: c.idBoard,
+            boardName: c.board?.name,
+            listId: c.idList,
+            listName: c.list?.name,
+            due: c.due ?? null,
+            dueComplete: c.dueComplete ?? false,
+            start: c.start ?? null,
+            labels: c.labels.map(l => l.name || l.color),
+            idMembers: c.idMembers,
+            dateLastActivity: c.dateLastActivity,
             isGroomed: this.semantics.isGroomed(c.name)
           }));
 
