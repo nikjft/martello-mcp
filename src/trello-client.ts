@@ -261,6 +261,34 @@ export class TrelloClient {
     });
   }
 
+  async setDueComplete(cardId: string, complete: boolean): Promise<TrelloCard> {
+    await this.ensureActiveCard(cardId);
+    return this.request(`/cards/${encodeURIComponent(cardId)}`, {
+      method: 'PUT',
+      body: { dueComplete: complete }
+    });
+  }
+
+  async getCardAttachments(cardId: string): Promise<any[]> {
+    await this.ensureActiveCard(cardId);
+    return this.request(`/cards/${encodeURIComponent(cardId)}/attachments`);
+  }
+
+  async addAttachmentToCard(cardId: string, url: string, name?: string): Promise<any> {
+    await this.ensureActiveCard(cardId);
+    return this.request(`/cards/${encodeURIComponent(cardId)}/attachments`, {
+      method: 'POST',
+      body: { url, name }
+    });
+  }
+
+  async removeAttachmentFromCard(cardId: string, attachmentId: string): Promise<void> {
+    await this.ensureActiveCard(cardId);
+    await this.request(`/cards/${encodeURIComponent(cardId)}/attachments/${encodeURIComponent(attachmentId)}`, {
+      method: 'DELETE'
+    });
+  }
+
   async getBoardLabels(boardId: string): Promise<any[]> {
     const openBoards = await this.getMyBoards();
     if (!openBoards.some(b => b.id === boardId)) {

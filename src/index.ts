@@ -537,6 +537,87 @@ export class MartelloMCP extends McpAgent {
       }
     );
 
+    // set_due_complete
+    this.server.tool(
+      "set_due_complete",
+      {
+        cardId: z.string().describe("Trello card ID, Short Link, or URL."),
+        complete: z.boolean().optional().describe("Desired state. If omitted, the current state is toggled.")
+      },
+      async ({ cardId: rawId, complete }) => {
+        try {
+          checkInit();
+          const cardId = this.semantics.extractCardId(rawId);
+          let target = complete;
+          if (target === undefined) {
+            const card = await this.client.getCard(cardId);
+            target = !card.dueComplete;
+          }
+          const updated = await this.client.setDueComplete(cardId, target);
+          return { content: [{ type: "text", text: JSON.stringify(updated, null, 2) }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
+      }
+    );
+
+    // get_card_attachments
+    this.server.tool(
+      "get_card_attachments",
+      {
+        cardId: z.string().describe("Trello card ID, Short Link, or URL.")
+      },
+      async ({ cardId: rawId }) => {
+        try {
+          checkInit();
+          const cardId = this.semantics.extractCardId(rawId);
+          const attachments = await this.client.getCardAttachments(cardId);
+          return { content: [{ type: "text", text: JSON.stringify(attachments, null, 2) }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
+      }
+    );
+
+    // add_attachment_to_card
+    this.server.tool(
+      "add_attachment_to_card",
+      {
+        cardId: z.string().describe("Trello card ID, Short Link, or URL."),
+        url: z.string().describe("The URL to attach."),
+        name: z.string().optional().describe("Optional display name for the attachment.")
+      },
+      async ({ cardId: rawId, url, name }) => {
+        try {
+          checkInit();
+          const cardId = this.semantics.extractCardId(rawId);
+          const attachment = await this.client.addAttachmentToCard(cardId, url, name);
+          return { content: [{ type: "text", text: JSON.stringify(attachment, null, 2) }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
+      }
+    );
+
+    // remove_attachment_from_card
+    this.server.tool(
+      "remove_attachment_from_card",
+      {
+        cardId: z.string().describe("Trello card ID, Short Link, or URL."),
+        attachmentId: z.string().describe("The ID of the attachment to remove (see get_card_attachments).")
+      },
+      async ({ cardId: rawId, attachmentId }) => {
+        try {
+          checkInit();
+          const cardId = this.semantics.extractCardId(rawId);
+          await this.client.removeAttachmentFromCard(cardId, attachmentId);
+          return { content: [{ type: "text", text: "Attachment removed successfully." }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+        }
+      }
+    );
+
     // 13. search_members
     this.server.tool(
       "search_members",
